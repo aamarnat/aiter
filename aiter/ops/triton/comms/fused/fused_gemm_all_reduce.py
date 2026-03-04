@@ -9,27 +9,16 @@ Registers torch.ops.aiter.fused_gemm_all_reduce_k_shard custom op.
 
 import torch
 import torch.distributed as dist
-from pathlib import Path
-import sys
 import os
 
 # Set environment variable for Triton
 os.environ['TRITON_ALLOW_NON_CONSTEXPR_GLOBALS'] = '1'
 
-# Import iris
 import iris
 
-# Import persistent_gemm_all_reduce kernel
-# Add iris examples directory to path
-# Path: aiter/aiter/ops/triton/comms/fused/fused_gemm_all_reduce.py -> need 7 parents to reach /workspace
-workspace_path = Path(__file__).parent.parent.parent.parent.parent.parent.parent  # /workspace
-iris_examples_path = workspace_path / "iris" / "examples" / "08_gemm_all_reduce_atomics"
-if iris_examples_path.exists() and str(iris_examples_path) not in sys.path:
-    sys.path.insert(0, str(iris_examples_path))
+from iris.ops.matmul_all_reduce import matmul_all_reduce
+from iris.ops.config import FusedConfig
 
-IRIS_AVAILABLE = False
-from gemm_all_reduce_atomics import persistent_gemm_all_reduce  # type: ignore
-IRIS_AVAILABLE = True
 print("✓ persistent_gemm_all_reduce kernel available")
 
 
@@ -40,123 +29,72 @@ def gemm_all_reduce_k_shard_wrapper(
     group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Wrapper function for GEMM + all-reduce to be used as a torch custom op (aiter.fused_gemm_all_reduce_k_shard).
-    
-    This variant handles K-dimension sharding where each rank computes a partial
-    result with a slice of K, then reduces across all ranks using atomic operations.
-    
+    Wrapper for iris.ops.matmul_all_reduce, registered as
+    torch.ops.aiter.fused_gemm_all_reduce_k_shard.
+
+    Each rank holds a local input (M, K_local) and a local weight shard
+    (K_local, N).  The kernel computes C_local = x @ weight, then atomically
+    accumulates across all ranks so every rank ends up with:
+
+        C_global = sum_r (x_r @ weight_r)   (i.e. all_reduce of the local GEMMs)
+
     Args:
-        x: Input tensor (M, K_local) - sharded on K dimension
-        weights: List of weight tensors [(K_local, N)]
-        reduce_dim: Dimension along which to reduce (1 for K dimension)
-        group_name: Process group name
-        
+        x: Local input tensor (M, K_local)
+        weights: List containing one weight tensor [(K_local, N)]
+        reduce_dim: Unused (kept for op signature compatibility)
+        group_name: Unused (kept for op signature compatibility)
+
     Returns:
-        Tuple of (local_partial_output, global_reduced_output)
+        (C_local, C_global)
+        - C_local: zeros placeholder with shape (M, N) — the fused kernel
+                   writes directly into C_global without a separate local buffer
+        - C_global: All-reduced result (M, N) in iris shared memory
     """
     print(f"[EXEC] gemm_all_reduce_k_shard_wrapper called (device: {x.device})")
-    
-    if not IRIS_AVAILABLE or persistent_gemm_all_reduce is None:
-        raise RuntimeError("persistent_gemm_all_reduce kernel not available")
-    
+
     shmem = iris.iris()
-    
-    # Get distributed info
-    try:
-        if dist.is_initialized():
-            world_size = dist.get_world_size()
-            cur_rank = dist.get_rank()
-        else:
-            # Not in distributed mode, use defaults for testing
-            world_size = 1
-            cur_rank = 0
-    except (RuntimeError, ValueError):
-        # Not in distributed mode, use defaults for testing
-        world_size = 1
-        cur_rank = 0
-    
-    # Unpack dimensions - sharding on K dimension
-    M = x.shape[0]
-    K_local = x.shape[1]
     weight = weights[0]
+    M, K_local = x.shape
     N = weight.shape[1]
 
-    # Allocate output tensors
-    C_local = torch.zeros((M, N), dtype=x.dtype, device=x.device)  # Local partial GEMM output
-    
-    # Allocate global output tensor in Iris's shared memory heap for remote access
-    # This will accumulate the reduced results from all ranks
+    # Place x in iris shared memory so the kernel can use RDMA for the reduce
+    A_iris = shmem.zeros(x.shape, dtype=x.dtype, device=x.device)
+    A_iris.copy_(x)
+
+    # Output in iris shared memory — matmul_all_reduce_preamble zeros it and
+    # calls shmem.barrier() before the kernel launches
     C_global = shmem.zeros((M, N), dtype=x.dtype, device=x.device)
 
-    # Kernel parameters
-    BLOCK_M = 256
-    BLOCK_N = 64
-    BLOCK_K = 64
-    GROUP_SIZE_M = 6
-    NUM_XCDS = 1  # Single chiplet
-    # Use actual GPU multiprocessor count
-    NUM_SMS = torch.cuda.get_device_properties(x.device).multi_processor_count
-    
-    # Compute strides
-    stride_am = x.stride(0)
-    stride_ak = x.stride(1)
-    stride_bk = weight.stride(0)
-    stride_bn = weight.stride(1)
-    stride_cm = C_local.stride(0)
-    stride_cn = C_local.stride(1)
-    stride_cm_global = C_global.stride(0)
-    stride_cn_global = C_global.stride(1)
-    
-    # Get heap bases from shmem for RDMA communication
-    heap_bases = shmem.get_heap_bases()
-    
-    # Kernel configuration
-    # EVEN_K checks if K_local is evenly divisible by BLOCK_K
-    EVEN_K = (K_local % BLOCK_K == 0)
-    
-    # Launch the persistent_gemm_all_reduce kernel
-    grid = (NUM_SMS,)
-    
-    # Bias parameters (not used in this version)
-    bias_ptr = None
-    stride_bias = 0
-    BIAS = False
-    
-    persistent_gemm_all_reduce[grid](
-        x,
-        weight,
-        C_local,
-        C_global,
-        bias_ptr,
-        M,
-        N,
-        K_local,
-        stride_am,
-        stride_ak,
-        stride_bk,
-        stride_bn,
-        stride_cm,
-        stride_cn,
-        stride_cm_global,
-        stride_cn_global,
-        stride_bias,
-        BLOCK_SIZE_M=BLOCK_M,
-        BLOCK_SIZE_N=BLOCK_N,
-        BLOCK_SIZE_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        NUM_SMS=NUM_SMS,
-        NUM_XCDS=NUM_XCDS,
-        BIAS=BIAS,
-        EVEN_K=EVEN_K,
-        heap_bases=heap_bases,
-        cur_rank=cur_rank,
-        world_size=world_size,
+    # C_local is a placeholder; the fused kernel accumulates into C_global directly
+    C_local = torch.zeros((M, N), dtype=x.dtype, device=x.device)
+
+    # Choose block sizes that fit the actual problem dimensions
+    bm = 128
+    while bm > 16 and bm > M:
+        bm //= 2
+    bn = 64
+    while bn > 16 and bn > N:
+        bn //= 2
+    bk = 64
+    while bk > 8 and bk > K_local:
+        bk //= 2
+
+    config = FusedConfig(
+        block_size_m=bm,
+        block_size_n=bn,
+        block_size_k=bk,
+        group_size_m=1,
+        num_xcds=1,
+        all_reduce_variant="atomic",
     )
 
+    # iris.ops.matmul_all_reduce: C_global = all_reduce(A_iris @ weight)
+    # Calls shmem.barrier() internally (async_op=False)
+    matmul_all_reduce(shmem, C_global, A_iris, weight, config=config)
+
     torch.cuda.synchronize()
-    shmem.barrier()
     dist.barrier()
-    
+
     return C_local, C_global
 
 
@@ -166,49 +104,39 @@ def gemm_all_reduce_k_shard_fake(
     reduce_dim: int,
     group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fake implementation for meta mode / shape inference (K-sharding)"""
-    
-    # Infer shapes - sharding on K dimension
+    """Fake implementation for meta mode / shape inference."""
     M = x.shape[0]
-    K_local = x.shape[1]
     N = weights[0].shape[1]
-    
     local_output = torch.empty((M, N), dtype=x.dtype, device=x.device)
     global_output = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    
     return local_output, global_output
 
 
-# Register the custom op for K-sharding
-if IRIS_AVAILABLE:
-    try:
-        from torch.library import Library
-        from csrc.cpp_itfs.torch_utils import direct_register_custom_op
-        
-        # Create a FRAGMENT library for fused operations
-        _fused_ops_lib = Library("aiter", "FRAGMENT")
-        
-        direct_register_custom_op(
-            op_name="fused_gemm_all_reduce_k_shard",
-            op_func=gemm_all_reduce_k_shard_wrapper,
-            mutates_args=[],
-            fake_impl=gemm_all_reduce_k_shard_fake,
-            target_lib=_fused_ops_lib,
-            dispatch_key="CUDA",
-        )
-        
-        print("✓ Registered torch.ops.aiter.fused_gemm_all_reduce_k_shard custom op")
-    except Exception as e:
-        print(f"⚠ Failed to register aiter.fused_gemm_all_reduce_k_shard custom op: {e}")
-        import traceback
-        traceback.print_exc()
-else:
-    print("⚠ Cannot register aiter.fused_gemm_all_reduce_k_shard: persistent_gemm_all_reduce kernel not available")
+# Register the custom op
+try:
+    from torch.library import Library
+    from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
+    _fused_ops_lib = Library("aiter", "FRAGMENT")
+
+    direct_register_custom_op(
+        op_name="fused_gemm_all_reduce_k_shard",
+        op_func=gemm_all_reduce_k_shard_wrapper,
+        mutates_args=[],
+        fake_impl=gemm_all_reduce_k_shard_fake,
+        target_lib=_fused_ops_lib,
+        dispatch_key="CUDA",
+    )
+
+    print("✓ Registered torch.ops.aiter.fused_gemm_all_reduce_k_shard custom op")
+except Exception as e:
+    print(f"⚠ Failed to register aiter.fused_gemm_all_reduce_k_shard custom op: {e}")
+    import traceback
+    traceback.print_exc()
 
 
 # Public API
 __all__ = [
     "gemm_all_reduce_k_shard_wrapper",
     "gemm_all_reduce_k_shard_fake",
-    "IRIS_AVAILABLE",
 ]
