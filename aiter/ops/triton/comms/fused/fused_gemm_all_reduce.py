@@ -21,6 +21,16 @@ from iris.ops.config import FusedConfig
 
 print("✓ persistent_gemm_all_reduce kernel available")
 
+# Initialized lazily on first call (requires dist.init_process_group() to be done first)
+IRIS_INSTANCE = None
+
+
+def _get_iris():
+    global IRIS_INSTANCE
+    if IRIS_INSTANCE is None:
+        IRIS_INSTANCE = iris.iris()
+    return IRIS_INSTANCE
+
 
 def gemm_all_reduce_k_shard_wrapper(
     x: torch.Tensor,
@@ -52,18 +62,14 @@ def gemm_all_reduce_k_shard_wrapper(
     """
     print(f"[EXEC] gemm_all_reduce_k_shard_wrapper called (device: {x.device})")
 
-    shmem = iris.iris()
+    iris_inst = _get_iris()
     weight = weights[0]
     M, K_local = x.shape
     N = weight.shape[1]
 
-    # Place x in iris shared memory so the kernel can use RDMA for the reduce
-    A_iris = shmem.zeros(x.shape, dtype=x.dtype, device=x.device)
-    A_iris.copy_(x)
-
     # Output in iris shared memory — matmul_all_reduce_preamble zeros it and
     # calls shmem.barrier() before the kernel launches
-    C_global = shmem.zeros((M, N), dtype=x.dtype, device=x.device)
+    C_global = iris_inst.zeros((M, N), dtype=x.dtype, device=x.device)
 
     # C_local is a placeholder; the fused kernel accumulates into C_global directly
     C_local = torch.zeros((M, N), dtype=x.dtype, device=x.device)
@@ -88,9 +94,9 @@ def gemm_all_reduce_k_shard_wrapper(
         all_reduce_variant="atomic",
     )
 
-    # iris.ops.matmul_all_reduce: C_global = all_reduce(A_iris @ weight)
+    # iris.ops.matmul_all_reduce: C_global = all_reduce(x @ weight)
     # Calls shmem.barrier() internally (async_op=False)
-    matmul_all_reduce(shmem, C_global, A_iris, weight, config=config)
+    matmul_all_reduce(iris_inst, C_global, x, weight, config=config)
 
     torch.cuda.synchronize()
     dist.barrier()

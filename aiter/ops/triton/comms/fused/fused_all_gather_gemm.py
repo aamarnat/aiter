@@ -22,6 +22,16 @@ from iris.ops.config import FusedConfig
 
 print("✓ iris.ops.all_gather_matmul available")
 
+# Initialized lazily on first call (requires dist.init_process_group() to be done first)
+IRIS_INSTANCE = None
+
+
+def _get_iris():
+    global IRIS_INSTANCE
+    if IRIS_INSTANCE is None:
+        IRIS_INSTANCE = iris.iris()
+    return IRIS_INSTANCE
+
 
 def all_gather_gemm_k_shard_wrapper(
     x: torch.Tensor,
@@ -45,15 +55,14 @@ def all_gather_gemm_k_shard_wrapper(
     """
     print(f"[EXEC] all_gather_gemm_k_shard_wrapper called (device: {x.device})")
 
-    shmem = iris.iris()
+    iris_inst = _get_iris()
     weight = weights[0]
     M, K_local = x.shape
-    K = K_local * shmem.get_num_ranks()
+    K = K_local * iris_inst.get_num_ranks()
     N = weight.shape[1]
 
-    # Copy input into iris shared memory so remote ranks can pull it
-    A_iris = shmem.zeros(x.shape, dtype=x.dtype, device=x.device)
-    A_iris.copy_(x)
+    # x must be in iris symmetric memory so remote ranks can RDMA-pull it
+    A_iris = iris_inst.as_symmetric(x)
 
     A_gathered = torch.zeros((M, K), dtype=x.dtype, device=x.device)
     C = torch.zeros((M, N), dtype=x.dtype, device=x.device)
@@ -79,7 +88,7 @@ def all_gather_gemm_k_shard_wrapper(
 
     # iris.ops.all_gather_matmul: C = all_gather(A_iris) @ weight
     # It calls shmem.barrier() internally (async_op=False)
-    all_gather_matmul(shmem, C, A_iris, weight, config=config)
+    all_gather_matmul(iris_inst, C, A_iris, weight, config=config)
 
     torch.cuda.synchronize()
     dist.barrier()
