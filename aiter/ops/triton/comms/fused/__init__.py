@@ -25,6 +25,11 @@ from .fused_all_gather_gemm import (
     all_gather_gemm_k_shard_fake,
 )
 
+from .fused_all_gather_gemm_m_shard import (
+    all_gather_gemm_m_shard_wrapper,
+    all_gather_gemm_m_shard_fake,
+)
+
 from .fused_gemm_all_scatter import (
     gemm_all_scatter_n_shard_wrapper,
     gemm_all_scatter_n_shard_fake,
@@ -37,9 +42,12 @@ from .fused_gemm_all_reduce import (
 
 __all__ = [
     "reduce_scatter_rmsnorm_quant_all_gather",
-    # All-Gather + GEMM
+    # All-Gather + GEMM (K-sharded)
     "all_gather_gemm_k_shard_wrapper",
     "all_gather_gemm_k_shard_fake",
+    # All-Gather + GEMM (M-sharded)
+    "all_gather_gemm_m_shard_wrapper",
+    "all_gather_gemm_m_shard_fake",
     # GEMM + All-Scatter
     "gemm_all_scatter_n_shard_wrapper",
     "gemm_all_scatter_n_shard_fake",
