@@ -10,7 +10,7 @@ Registers torch.ops.aiter.fused_gemm_all_reduce_k_shard custom op.
 import torch
 import os
 
-os.environ['TRITON_ALLOW_NON_CONSTEXPR_GLOBALS'] = '1'
+os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"
 
 import iris
 
@@ -43,9 +43,11 @@ def init_iris(heap_size: int = 1 << 30):
     if IRIS_INSTANCE is not None:
         return IRIS_INSTANCE
     IRIS_INSTANCE = iris.iris(heap_size=heap_size)
-    print(f"✓ Iris context initialized for fused GEMM+AR: "
-          f"rank {IRIS_INSTANCE.cur_rank}/{IRIS_INSTANCE.num_ranks}, "
-          f"heap={heap_size / (1 << 20):.0f}MB")
+    print(
+        f"✓ Iris context initialized for fused GEMM+AR: "
+        f"rank {IRIS_INSTANCE.cur_rank}/{IRIS_INSTANCE.num_ranks}, "
+        f"heap={heap_size / (1 << 20):.0f}MB"
+    )
     return IRIS_INSTANCE
 
 
@@ -133,7 +135,9 @@ def gemm_all_reduce_k_shard_wrapper(
 
     # Cache SM count once (host-side query forbidden during CUDAGraph capture)
     if _CACHED_NUM_SMS is None:
-        _CACHED_NUM_SMS = torch.cuda.get_device_properties(x.device).multi_processor_count
+        _CACHED_NUM_SMS = torch.cuda.get_device_properties(
+            x.device
+        ).multi_processor_count
 
     # Reuse symmetric output buffer when (M, N, dtype) match.
     # Dict-based cache supports multiple shapes so that different layers
@@ -161,8 +165,12 @@ def gemm_all_reduce_k_shard_wrapper(
     )
 
     workspace = matmul_all_reduce(
-        iris_inst, c_global, x, weight,
-        config=config, workspace=workspace,
+        iris_inst,
+        c_global,
+        x,
+        weight,
+        config=config,
+        workspace=workspace,
         async_op=True,  # two_shot uses versioned locks; post-kernel barrier is unnecessary
     )
     _BUFFER_CACHE[cache_key] = (c_global, c_local, workspace)
@@ -212,8 +220,10 @@ def warmup_buffers(compile_sizes=None, weight_shapes=None, dtype=torch.bfloat16)
                     _BUFFER_CACHE[cache_key] = (c_global, c_local, workspace)
                     warmed += 1
 
-    print(f"✓ Iris warmup complete: cached device_context + num_sms={_CACHED_NUM_SMS}"
-          + (f", pre-allocated {warmed} buffer(s)" if warmed else ""))
+    print(
+        f"✓ Iris warmup complete: cached device_context + num_sms={_CACHED_NUM_SMS}"
+        + (f", pre-allocated {warmed} buffer(s)" if warmed else "")
+    )
 
 
 def gemm_all_reduce_k_shard_fake(
@@ -250,6 +260,7 @@ try:
 except Exception as e:
     print(f"⚠ Failed to register aiter.fused_gemm_all_reduce_k_shard custom op: {e}")
     import traceback
+
     traceback.print_exc()
 
 
