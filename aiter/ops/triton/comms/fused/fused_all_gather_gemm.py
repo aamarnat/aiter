@@ -12,7 +12,8 @@ import torch.distributed as dist
 
 # Set environment variable for Triton
 import os
-os.environ['TRITON_ALLOW_NON_CONSTEXPR_GLOBALS'] = '1'
+
+os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"
 
 # Import iris
 import iris
@@ -138,6 +139,7 @@ try:
 except Exception as e:
     print(f"⚠ Failed to register aiter.fused_all_gather_gemm_k_shard custom op: {e}")
     import traceback
+
     traceback.print_exc()
 
 
