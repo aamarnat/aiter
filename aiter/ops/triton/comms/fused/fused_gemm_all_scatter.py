@@ -22,6 +22,15 @@ import iris
 # Import persistent_gemm_all_scatter kernel
 # Add iris examples directory to path
 # Path: aiter/aiter/ops/triton/comms/fused/fused_gemm_all_scatter.py -> need 7 parents to reach /workspace
+#
+# NOTE: this import path is fragile and is slated for replacement by a production
+# iris API (as the sibling fused ops already do, e.g. iris.ops.matmul_all_reduce).
+# It depends on the iris repo being checked out at a fixed nesting depth relative
+# to this file and on an examples module being importable by its bare name, so it
+# misses for a pip-installed aiter, a differently nested container layout, or an
+# iris install without its examples. Until it is replaced, that miss must stay
+# non-fatal: an unguarded import here raises at module scope and takes down the
+# entire aiter.ops.triton.comms.fused package for every other op in it.
 workspace_path = Path(
     __file__
 ).parent.parent.parent.parent.parent.parent.parent  # /workspace
@@ -30,10 +39,26 @@ if iris_examples_path.exists() and str(iris_examples_path) not in sys.path:
     sys.path.insert(0, str(iris_examples_path))
 
 IRIS_AVAILABLE = False
-from gemm_all_scatter import persistent_gemm_all_scatter  # type: ignore # noqa: E402
+try:
+    from gemm_all_scatter import (  # type: ignore # noqa: E402
+        persistent_gemm_all_scatter,
+    )
 
-IRIS_AVAILABLE = True
-print("✓ persistent_gemm_all_scatter kernel available")
+    IRIS_AVAILABLE = True
+    print("✓ persistent_gemm_all_scatter kernel available")
+except Exception as e:
+    # Deliberately broad: this import transitively runs @triton.jit at module
+    # scope and pulls in triton/iris internals, so a version mismatch surfaces
+    # as AttributeError or worse rather than ImportError. Nothing here may be
+    # allowed to take down the whole aiter.ops.triton.comms.fused package.
+    persistent_gemm_all_scatter = None
+    print(
+        f"⚠ Could not import 'gemm_all_scatter.persistent_gemm_all_scatter' "
+        f"(searched iris examples dir {iris_examples_path}, "
+        f"exists={iris_examples_path.exists()}): {e}. "
+        f"torch.ops.aiter.fused_gemm_all_scatter_n_shard will not be registered; "
+        f"the rest of aiter.ops.triton.comms.fused is unaffected."
+    )
 
 
 def gemm_all_scatter_n_shard_wrapper(
