@@ -67,6 +67,8 @@ that delta can be measured without editing code.
 """
 
 import os
+import sys
+import time
 
 import torch
 import torch.distributed as dist
@@ -117,6 +119,37 @@ if _SYNC_MODE not in ("both", "raw", "none"):
 _SYNC_RAW = _SYNC_MODE in ("both", "raw")
 # WAR guard: peers' pulls must finish before staging is overwritten.
 _SYNC_WAR = _SYNC_MODE == "both"
+
+
+# --- diagnostic tracing, off unless asked for --------------------------------
+# Set AITER_GEMM_RS_TRACE=1 to emit one line per symmetric-heap allocation and
+# (at =2) one line per launch. Pair it with AMD_SERIALIZE_KERNEL=3: dispatch
+# then becomes synchronous, so the last line printed before an HSA memory fault
+# is the launch that caused it, rather than whatever the host happened to be
+# doing when an asynchronous fault surfaced.
+#
+# This is DIAGNOSTIC ONLY -- it changes no behaviour when unset, and it is not
+# the fix for anything. Reading it once at import keeps the hot path free.
+_TRACE = int(os.environ.get("AITER_GEMM_RS_TRACE", "0") or 0)
+_TRACE_ALLOC = _TRACE >= 1
+_TRACE_LAUNCH = _TRACE >= 2
+
+
+def _trace(msg: str) -> None:
+    """Unbuffered, rank-tagged. stderr so it interleaves with the HSA fault."""
+    try:
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    except Exception:
+        rank = -1
+    print(f"[rs-trace r{rank}] {msg}", file=sys.stderr, flush=True)
+
+
+def _heap_offset():
+    """Bytes handed out by the iris allocator so far, or None. Never raises."""
+    try:
+        return int(IRIS_INSTANCE.heap.allocator.heap_offset)
+    except Exception:
+        return None
 
 
 IRIS_INSTANCE = None
@@ -425,7 +458,21 @@ def _create_entry(M: int, N: int, dtype: torch.dtype, world_size: int):
     # kernel translates addresses as `peer_base + (ptr - my_base)`, so it can
     # only pull from a heap pointer. The output is an ordinary torch tensor,
     # allocated fresh per call.
-    staging = iris_inst.zeros((M, N), dtype=dtype)
+    if _TRACE_ALLOC:
+        _off_before = _heap_offset()
+        _t0 = time.perf_counter()
+        _trace(
+            f"ALLOC begin M={M} N={N} dtype={dtype} world={world_size} "
+            f"heap_offset_before={_off_before}"
+        )
+        staging = iris_inst.zeros((M, N), dtype=dtype)
+        _trace(
+            f"ALLOC end   M={M} N={N} heap_offset_after={_heap_offset()} "
+            f"wall_ms={(time.perf_counter() - _t0) * 1e3:.2f} "
+            f"staging_ptr=0x{staging.data_ptr():x}"
+        )
+    else:
+        staging = iris_inst.zeros((M, N), dtype=dtype)
 
     if _SYNC_TENSOR is None:
         _SYNC_TENSOR = torch.zeros(1, dtype=torch.int32, device=device)
@@ -624,6 +671,23 @@ def warmup_buffers(
         _warm_one(M, N, shape_dtype, world_size)
         warmed += 0 if already else 1
 
+    if _TRACE_ALLOC:
+        # The VA map, so a later HSA fault address can be tested for membership.
+        # If the faulting address lies outside every range printed here, the
+        # fault did not come from this op's heap traffic.
+        try:
+            alloc = iris_inst.heap.allocator
+            base = int(alloc.get_base_address())
+            _trace(
+                f"HEAPMAP local_base=0x{base:x} size=0x{int(alloc.heap_size):x} "
+                f"end=0x{base + int(alloc.heap_size):x} "
+                f"used={_heap_offset()} peers="
+                + ",".join(f"0x{int(v):x}" for v in alloc.heap_bases_array)
+            )
+        except Exception as e:  # pragma: no cover - diagnostics must never fail
+            _trace(f"HEAPMAP unavailable: {type(e).__name__}: {e}")
+        _trace(f"WARMUP COMPLETE warmed={warmed} cached={len(_BUFFER_CACHE)}")
+
     print(
         f"✓ Iris GEMM+RS warmup complete: num_sms={_CACHED_NUM_SMS}, "
         f"world_size={world_size}, dtypes={[str(d) for d in dtypes]}, "
@@ -731,6 +795,13 @@ def gemm_reduce_scatter_m_shard_wrapper(
     # from the graph's private pool.
     output = torch.empty((M_local, N), dtype=x.dtype, device=device)
 
+    if _TRACE_LAUNCH:
+        _trace(
+            f"FUSED M={M} N={N} K_local={x.shape[1]} dtype={x.dtype} "
+            f"bias={bias is not None} staging_ptr=0x{staging.data_ptr():x} "
+            f"out_ptr=0x{output.data_ptr():x}"
+        )
+
     if bias is None:
         torch.mm(x, weight, out=staging)
     else:
@@ -830,6 +901,12 @@ def reduce_scatter_m_shard_wrapper(
 
     # Fresh, never cached -- see gemm_reduce_scatter_m_shard_wrapper.
     output = torch.empty((M_local, N), dtype=x.dtype, device=device)
+
+    if _TRACE_LAUNCH:
+        _trace(
+            f"STANDALONE M={M} N={N} dtype={x.dtype} "
+            f"staging_ptr=0x{staging.data_ptr():x} out_ptr=0x{output.data_ptr():x}"
+        )
 
     staging.copy_(x)
 
