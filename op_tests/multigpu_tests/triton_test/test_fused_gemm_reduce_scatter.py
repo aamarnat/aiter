@@ -296,14 +296,14 @@ def _symmetric_heap_offset():
         return None
 
 
-def _cache_probe(M, N, dtype):
+def _cache_probe(M, N, dtype, world_size):
     """Report the resolved launch config and buffer identity for (M, N, dtype).
 
     Reaches into the op's private ``_BUFFER_CACHE`` on purpose: proving that a
     ragged shape really did hit the kernel's M/N tail path requires knowing the
     ``block_m``/``block_n`` the op resolved, and there is no public accessor.
     """
-    entry = getattr(FUSED_RS, "_BUFFER_CACHE", {}).get((M, N, dtype))
+    entry = getattr(FUSED_RS, "_BUFFER_CACHE", {}).get((M, N, dtype, world_size))
     if entry is None:
         return {}
     # No output buffer is cached, by design: the ops are registered pure, so a
@@ -497,7 +497,7 @@ def _worker_correctness(tp_size, gpu_id, cfg):
             res[f"{name}_err"] = err
             res[f"{name}_bias_err"] = bias_err
 
-        res.update(_cache_probe(M, N, dtype))
+        res.update(_cache_probe(M, N, dtype, tp_size))
         torch.cuda.synchronize()
         return res
 
@@ -531,7 +531,7 @@ def _worker_graph(tp_size, gpu_id, cfg):
         torch.cuda.synchronize()
         dist.barrier()
 
-        probe_before = _cache_probe(M, N, dtype)
+        probe_before = _cache_probe(M, N, dtype, tp_size)
         assert probe_before, (
             f"[rank {env['rank']}] warmup_buffers() left ({M}, {N}, {dtype}) "
             f"uncached, so the first captured call would allocate on the "
@@ -572,7 +572,7 @@ def _worker_graph(tp_size, gpu_id, cfg):
         torch.cuda.synchronize()
         mem_after = torch.cuda.memory_allocated(env["device"])
         heap_after = _symmetric_heap_offset()
-        probe_after = _cache_probe(M, N, dtype)
+        probe_after = _cache_probe(M, N, dtype, tp_size)
         drift = max_drift.item()
 
         # Replaying a graph must be bit-identical: same inputs, same buffers.
@@ -726,7 +726,7 @@ def _worker_drift(tp_size, gpu_id, cfg):
             "drift_bound": drift_bound,
             "heap_growth_B": heap_growth,
         }
-        res.update(_cache_probe(M, N, dtype))
+        res.update(_cache_probe(M, N, dtype, tp_size))
         torch.cuda.synchronize()
         return res
 
