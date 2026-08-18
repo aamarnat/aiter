@@ -664,7 +664,7 @@ def warmup_buffers(
         if M % world_size != 0:
             skipped.append((M, N))
             continue
-        already = (M, N, shape_dtype) in _BUFFER_CACHE
+        already = (M, N, shape_dtype, world_size) in _BUFFER_CACHE
         # Run the dummy iteration even on a cache hit: the entry may have been
         # created by a cache miss on the hot path, which never JIT-warms the
         # other specializations, and re-running is cheap and idempotent.
