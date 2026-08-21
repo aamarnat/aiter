@@ -64,6 +64,38 @@ number is the only one that corresponds to a correct implementation, and each
 guard has been budgeted at roughly 0.07 ms/call upstream -- large enough,
 relative to a ~92 us reduce-scatter, to invert the result. The variable exists so
 that delta can be measured without editing code.
+
+That ``none`` configuration has since been measured end-to-end and is broken:
+gsm8k 0.005 against 0.905 on an otherwise identical serving arm. So the guards
+cannot simply be deleted. What *can* go is their cost.
+
+Which primitive implements the guards -- ``AITER_GEMM_RS_SYNC_IMPL``
+--------------------------------------------------------------------
+``AITER_GEMM_RS_SYNC`` selects *how many* guards run. This second variable, also
+read once at import, selects *what a guard is*:
+
+- ``rccl`` (default): a 1-element ``dist.all_reduce``. Correct, and what every
+  number recorded for this op so far was measured with. It is a full RCCL
+  collective launch, budgeted at 15-50 us against a 30-90 us kernel -- which is
+  the entire reason the correctly-synchronised op loses to plain RCCL.
+- ``device``: ``iris.device_barrier()`` -- a single-CTA Triton kernel that
+  atomically bumps this rank's flag on the symmetric heap
+  (``atomic_add``, ``release``, ``sys``) and spin-polls every peer's flag for the
+  same epoch (``atomic_cas``, ``acquire``, ``sys``). Same ordering guarantee,
+  no RCCL launch. Graph-capturable, and iris tests it under capture-and-replay
+  around a remote read and a remote write
+  (``iris/tests/unittests/test_barriers.py``).
+
+Both primitives give the same stream-level cross-rank ordering, so ``both``
+remains correct under either. The default is deliberately left at ``rccl`` so
+that the recorded 0.36-0.99x baseline stays reproducible without editing code;
+``device`` is the configuration under test.
+
+Every rank must agree on *both* variables. The mode fixes how many collectives
+each call issues and the impl fixes which collective, so a rank that disagrees
+on either deadlocks -- one rank waiting in RCCL while another spins on heap
+flags produces no diagnostic at all. ``warmup_buffers`` checks both
+(``_check_sync_mode_agreement``).
 """
 
 import os
@@ -119,6 +151,18 @@ if _SYNC_MODE not in ("both", "raw", "none"):
 _SYNC_RAW = _SYNC_MODE in ("both", "raw")
 # WAR guard: peers' pulls must finish before staging is overwritten.
 _SYNC_WAR = _SYNC_MODE == "both"
+
+# --- which primitive implements a guard, resolved once at import -------------
+# Orthogonal to _SYNC_MODE: that says how many guards, this says what one is.
+# See the module docstring. Default stays 'rccl' so the recorded baseline is
+# reproducible without editing code.
+_SYNC_IMPL = os.environ.get("AITER_GEMM_RS_SYNC_IMPL", "rccl").strip().lower()
+if _SYNC_IMPL not in ("rccl", "device"):
+    print(
+        f"⚠ AITER_GEMM_RS_SYNC_IMPL={_SYNC_IMPL!r} is not one of 'rccl', "
+        f"'device'; falling back to 'rccl'."
+    )
+    _SYNC_IMPL = "rccl"
 
 
 # --- diagnostic tracing, off unless asked for --------------------------------
@@ -491,20 +535,51 @@ def _cache_num_sms(device) -> None:
 
 
 def _cross_rank_sync(sync_tensor: torch.Tensor) -> None:
-    """Stream-level cross-rank sync on a preallocated 1-element tensor.
+    """Stream-level cross-rank sync. Dispatches on ``AITER_GEMM_RS_SYNC_IMPL``.
 
-    Unlike ``ctx.barrier()`` this does not synchronize the host, so it can be
-    recorded into a graph; it only orders this rank's stream against its peers'.
-    It runs on the *default* process group, which is the communicator iris's
-    symmetric heap spans -- ``group_name`` is deliberately not used here, since
-    the ranks that must be ordered are exactly the ranks the RS kernel pulls
-    from. ``_check_iris_world_size`` guarantees the two agree.
+    Neither implementation synchronizes the host, so both can be recorded into a
+    graph; both only order this rank's stream against its peers'. Both run over
+    the *default* process group / the full iris communicator -- ``group_name`` is
+    deliberately not used here, since the ranks that must be ordered are exactly
+    the ranks the RS kernel pulls from, and ``_check_iris_world_size`` guarantees
+    the two agree.
 
-    The FIRST such call lazily creates the RCCL communicator, which is illegal
-    inside a graph capture region; ``warmup_buffers()`` issues one so that never
-    happens during capture.
+    Both have a first-call side effect that is illegal inside a capture region --
+    RCCL communicator creation, or the collective heap allocation of the iris
+    barrier flags plus a Triton JIT. ``warmup_buffers()`` triggers BOTH,
+    regardless of which is selected, so that flipping either environment
+    variable can never move a collective into a capture region.
+
+    The branch is on a module-level bool resolved at import, so the hot path
+    costs one predictable test and no environment lookup.
     """
-    dist.all_reduce(sync_tensor)
+    if _SYNC_IMPL == "device":
+        _device_barrier()
+    else:
+        dist.all_reduce(sync_tensor)
+
+
+def _device_barrier() -> None:
+    """iris device-side barrier: same ordering as the RCCL token, no RCCL launch.
+
+    ``ctx.device_barrier()`` launches a single-CTA Triton kernel that bumps this
+    rank's flag on the symmetric heap with an ``atomic_add`` (release, system
+    scope) and then spin-polls every peer's flag for the same epoch with an
+    ``atomic_cas`` (acquire, system scope). A rank therefore leaves the barrier
+    only once every peer has *entered* it, which is the same guarantee the
+    1-element ``dist.all_reduce`` provides and is what both guards rely on:
+
+    - as the RAW guard, leaving it means every peer's GEMM kernel has completed
+      (their barrier launch is stream-ordered after it) and its writes to the
+      staging buffer are visible at system scope;
+    - as the WAR guard, leaving it means every peer's RS kernel has completed,
+      so the staging buffer can be overwritten.
+
+    The epoch counter lives on the device, one int32 per rank, and is advanced by
+    the kernel itself -- there is no host-side state -- which is what makes it
+    replay-safe under graph capture rather than frozen at capture time.
+    """
+    _get_iris().device_barrier()
 
 
 def register_shape(M: int, N: int, dtype: torch.dtype = torch.bfloat16) -> None:
@@ -533,6 +608,11 @@ def _warm_one(M: int, N: int, dtype: torch.dtype, world_size: int) -> None:
     hot path uses. The sync is issued unconditionally, even under
     ``AITER_GEMM_RS_SYNC=none``, so that flipping the variable never moves RCCL
     initialization into a capture region.
+
+    ``_warm_both_sync_impls`` extends the same argument across
+    ``AITER_GEMM_RS_SYNC_IMPL``: whichever primitive is selected, both are
+    primed, so flipping *that* variable cannot move a collective into a capture
+    region either.
     """
     entry = _BUFFER_CACHE.get((M, N, dtype, world_size))
     if entry is None:
@@ -547,7 +627,7 @@ def _warm_one(M: int, N: int, dtype: torch.dtype, world_size: int) -> None:
     torch.mm(dummy_a, dummy_b, out=staging)
     del dummy_a, dummy_b
 
-    _cross_rank_sync(sync_tensor)
+    _warm_both_sync_impls(sync_tensor)
     dummy_out = torch.empty((M_local, N), dtype=dtype, device=device)
     fast_reduce_scatter(
         _get_iris(),
@@ -558,28 +638,68 @@ def _warm_one(M: int, N: int, dtype: torch.dtype, world_size: int) -> None:
         num_sms,
         num_warps,
     )
-    _cross_rank_sync(sync_tensor)
+    _warm_both_sync_impls(sync_tensor)
+
+
+def _warm_both_sync_impls(sync_tensor: torch.Tensor) -> None:
+    """Trigger the first-call side effects of BOTH sync primitives. Collective.
+
+    Each primitive has a first-call side effect that cannot happen inside a
+    graph capture region: ``dist.all_reduce`` creates the RCCL communicator
+    lazily, and ``device_barrier`` allocates its per-group flags tensor on the
+    symmetric heap (collective -- ``ctx.zeros`` bottoms out in a host barrier)
+    and JIT-compiles the barrier kernel.
+
+    Both are primed here whichever one ``AITER_GEMM_RS_SYNC_IMPL`` selects, for
+    the same reason ``_warm_one`` issues a sync even under
+    ``AITER_GEMM_RS_SYNC=none``: an environment variable should never be able to
+    move a collective into a capture region. The flags tensor is
+    ``num_ranks`` int32s -- 32 bytes at TP=8 -- so priming the unused one costs
+    nothing that matters against a symmetric heap already under pressure.
+    """
+    dist.all_reduce(sync_tensor)
+    _device_barrier()
 
 
 def _check_sync_mode_agreement() -> None:
-    """Verify every rank read the same AITER_GEMM_RS_SYNC value.
+    """Verify every rank read the same AITER_GEMM_RS_SYNC and ..._SYNC_IMPL.
 
-    The mode decides how many ``dist.all_reduce`` calls each op issues, so a rank
-    that disagrees changes the collective count and the job hangs with no
-    diagnostic -- easy to hit when a launcher exports the variable on some nodes
-    only. Checked once at warmup, where a collective is free.
+    The mode decides how many guards each op issues and the impl decides which
+    primitive a guard is, so a rank that disagrees on *either* hangs the job with
+    no diagnostic -- easy to hit when a launcher exports the variables on some
+    nodes only. A mode mismatch changes the collective count; an impl mismatch is
+    nastier still, one rank blocking in RCCL while another spin-polls heap flags
+    that will never be bumped. Checked once at warmup, where a collective is
+    free.
+
+    Both values are checked in a single all-reduce. Each is encoded as the pair
+    ``(code, -code)`` and reduced with MAX, so any disagreement moves at least
+    one of the two elements away from this rank's own value -- MAX alone could
+    not distinguish "everyone agrees on 2" from "someone else said 2".
     """
     if not (dist.is_available() and dist.is_initialized()):
         return
-    codes = {"both": 0, "raw": 1, "none": 2}
-    mine = codes[_SYNC_MODE]
-    t = torch.tensor([mine, -mine], dtype=torch.int64, device=_get_iris().get_device())
+    mode_codes = {"both": 0, "raw": 1, "none": 2}
+    impl_codes = {"rccl": 0, "device": 1}
+    mine_mode = mode_codes[_SYNC_MODE]
+    mine_impl = impl_codes[_SYNC_IMPL]
+    mine = [mine_mode, -mine_mode, mine_impl, -mine_impl]
+    t = torch.tensor(mine, dtype=torch.int64, device=_get_iris().get_device())
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    if int(t[0]) != mine or int(t[1]) != -mine:
+    got = [int(v) for v in t]
+    if got[:2] != mine[:2]:
         raise RuntimeError(
             f"AITER_GEMM_RS_SYNC disagrees across ranks (this rank: {_SYNC_MODE!r}). "
             f"The mode controls how many collectives each fused GEMM+RS issues, so a "
             f"mismatch deadlocks. Export the same value on every rank."
+        )
+    if got[2:] != mine[2:]:
+        raise RuntimeError(
+            f"AITER_GEMM_RS_SYNC_IMPL disagrees across ranks (this rank: "
+            f"{_SYNC_IMPL!r}). The impl controls which primitive each guard uses, so "
+            f"a mismatch deadlocks -- ranks on 'rccl' block in a collective the ranks "
+            f"on 'device' never join, and those spin on heap flags nobody bumps. "
+            f"Export the same value on every rank."
         )
 
 
@@ -688,9 +808,13 @@ def warmup_buffers(
             _trace(f"HEAPMAP unavailable: {type(e).__name__}: {e}")
         _trace(f"WARMUP COMPLETE warmed={warmed} cached={len(_BUFFER_CACHE)}")
 
+    # The sync config is printed here, not just documented, because every perf
+    # number this op produces is only interpretable against it and job logs are
+    # the only durable record of what actually ran.
     print(
         f"✓ Iris GEMM+RS warmup complete: num_sms={_CACHED_NUM_SMS}, "
         f"world_size={world_size}, dtypes={[str(d) for d in dtypes]}, "
+        f"sync={_SYNC_MODE}, sync_impl={_SYNC_IMPL}, "
         f"pre-allocated {warmed} buffer(s), {len(_BUFFER_CACHE)} cached"
         + (f", skipped {skipped} (M not divisible by {world_size})" if skipped else "")
     )

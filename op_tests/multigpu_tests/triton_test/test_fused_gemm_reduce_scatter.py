@@ -131,10 +131,49 @@ MAX_ERR_RATIO = 0.02
 RTOL = 1e-2
 ATOL = 1e-2
 
-# Each test function spawns its own pool; give each a distinct rendezvous port.
-PORT_CORRECTNESS = 49380
-PORT_GRAPH = 49381
-PORT_DRIFT = 49382
+
+_PORT_LO, _PORT_HI = 20000, 32000
+
+
+def _free_port(attempts=50):
+    """A bindable TCP port BELOW the ephemeral range, for the rendezvous store.
+
+    Replaces three hardcoded constants. Two distinct failures, both measured on
+    radha f13-21, and the second is why this does not simply bind port 0:
+
+    1. The constants gave each *test function* one port, but each function then
+       sweeps TP=2, 4 and 8 and reused that one port across all three, so a later
+       sweep step hit the previous store's socket lingering in TIME_WAIT:
+       ``DistNetworkError ... port: 49380 ... EADDRINUSE``, before a single shape
+       was checked.
+    2. Asking the kernel for an ephemeral port instead (bind to 0, read it back,
+       close, re-bind in the child) still failed:
+       ``... port: 34607 ... EADDRINUSE``. Linux hands out 32768-60999 for
+       *outgoing* connections too, and this test churns a lot of them -- RCCL and
+       the store itself -- so between releasing the probe socket and the child
+       binding it, something else can legitimately be given the same port. Both
+       49380 and 34607 are inside that range; the fixed constants were only ever
+       a worse instance of the same bug.
+
+    So: pick below the ephemeral range, where the kernel will not assign the port
+    to anything else on its own, and confirm it is bindable. ``SO_REUSEADDR`` is
+    deliberately NOT set on the probe -- it would report a TIME_WAIT port as
+    free, which is failure (1) again.
+    """
+    import random
+    import socket
+
+    for _ in range(attempts):
+        port = random.randint(_PORT_LO, _PORT_HI)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+            except OSError:
+                continue
+        return port
+    raise RuntimeError(
+        f"no free TCP port in [{_PORT_LO}, {_PORT_HI}] after {attempts} tries"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -742,14 +781,18 @@ def _worker_drift(tp_size, gpu_id, cfg):
 # ---------------------------------------------------------------------------
 
 
-def _spawn(worker, tp_size, cfg, port):
+def _spawn(worker, tp_size, cfg):
     """Run ``worker`` on ``tp_size`` GPUs and return one result dict per rank.
 
     ``r.get()`` re-raises any worker exception in the parent, so a per-rank
     assertion failure fails the test rather than being swallowed.
+
+    A fresh rendezvous port per pool -- see ``_free_port``. Each caller sweeps
+    several TP sizes through here, and a port reused across them hits the
+    previous store's socket in TIME_WAIT.
     """
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+    os.environ["MASTER_PORT"] = str(_free_port())
     ensure_spawn_method()
 
     pool = mp.Pool(processes=tp_size)
@@ -862,7 +905,7 @@ def test_gemm_reduce_scatter(tp_size, M, N, K, dtype, bias_mode, heap_size):
         "heap_size": heap_size,
         "seed": 42,
     }
-    rows = _spawn(_worker_correctness, tp_size, cfg, PORT_CORRECTNESS)
+    rows = _spawn(_worker_correctness, tp_size, cfg)
 
     flops, nbytes = _roofline(
         M,
@@ -896,7 +939,7 @@ def test_graph_capture(tp_size, M, N, K, dtype, bias_mode, replays, heap_size):
         "replays": replays,
         "seed": 42,
     }
-    rows = _spawn(_worker_graph, tp_size, cfg, PORT_GRAPH)
+    rows = _spawn(_worker_graph, tp_size, cfg)
 
     flops, nbytes = _roofline(
         M,
@@ -932,7 +975,7 @@ def test_unbarriered_drift(tp_size, M, N, K, dtype, bias_mode, iters, heap_size)
         "iters": iters,
         "seed": 42,
     }
-    rows = _spawn(_worker_drift, tp_size, cfg, PORT_DRIFT)
+    rows = _spawn(_worker_drift, tp_size, cfg)
 
     flops, nbytes = _roofline(
         M,
@@ -956,11 +999,26 @@ def test_unbarriered_drift(tp_size, M, N, K, dtype, bias_mode, iters, heap_size)
 
 
 def summarize(name, rows):
+    """Print the results table. Must never be able to fail the run.
+
+    ``DataFrame.to_markdown`` needs the optional ``tabulate`` package, and
+    pandas raises ``ImportError`` when it is absent. That is a formatting
+    dependency, but because ``main`` calls this between test groups an
+    ImportError here aborts everything after it: measured on radha f13-21, the
+    30 correctness configurations all passed and then this line killed the
+    process before ``test_graph_capture`` or ``test_unbarriered_drift`` ran at
+    all, so the suite reported nothing and skipped its two hardest cases.
+    A results table is not worth a test run; fall back to plain text.
+    """
     if not rows:
         logger.warning("%s: no configurations ran", name)
         return
     df = pd.DataFrame(rows)
-    aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
+    try:
+        table = df.to_markdown(index=False)
+    except ImportError:
+        table = df.to_string(index=False)
+    aiter.logger.info("%s summary:\n%s", name, table)
 
 
 def main():
