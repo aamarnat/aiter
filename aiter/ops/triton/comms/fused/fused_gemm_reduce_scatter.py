@@ -861,15 +861,21 @@ def _entry_on_miss(M: int, N: int, dtype, world_size: int, group_name: str, op: 
     declared ceiling, what a miss now costs is a Triton JIT for that specialization,
     not a symmetric-heap allocation. One line per distinct shape (the second call
     hits the cache), so this cannot flood a log.
+
+    Says nothing when the miss is above the ceiling and is therefore about to be
+    refused: announcing "filling it now" for a call that ``_get_slab`` immediately
+    rejects would be a log line that lies, in a change whose entire point is that
+    the log should state what actually happened. The refusal speaks for itself.
     """
-    print(
-        f"ℹ fused GEMM+RS: buffer-cache miss for (M={M}, N={N}, dtype={dtype}, "
-        f"world_size={world_size}) on the {op} path -- a shape warmup did not cover. "
-        f"Filling it now: a view of the pre-allocated staging slab plus a Triton JIT "
-        f"for this specialization. No symmetric-heap allocation, provided "
-        f"M <= M_max={_MAX_M or 'undeclared'}. Legal here because this call is not "
-        f"inside a graph capture region."
-    )
+    if not (_MAX_M and M > _MAX_M):
+        print(
+            f"ℹ fused GEMM+RS: buffer-cache miss for (M={M}, N={N}, dtype={dtype}, "
+            f"world_size={world_size}) on the {op} path -- a shape warmup did not "
+            f"cover. Filling it now: a view of the pre-allocated staging slab plus a "
+            f"Triton JIT for this specialization. No symmetric-heap allocation, and "
+            f"M <= M_max={_MAX_M or 'undeclared'}. Legal here because this call is "
+            f"not inside a graph capture region."
+        )
     _check_iris_world_size(world_size, group_name)
     return _create_entry(M, N, dtype, world_size)
 
