@@ -27,6 +27,16 @@ What is covered
 3. ``test_unbarriered_drift`` -- >= 1000 back-to-back iterations with no host
    barrier and no host sync, which is the regime the headline speedup is measured
    in and which the upstream correctness run (barriered) does not validate.
+4. ``test_shape_coverage`` -- the staging heap is sized from a declared ceiling
+   rather than from the shapes that were warmed: exactly one slab per (N, dtype)
+   however many M are warmed, an unwarmed M below the ceiling both correct and
+   costing zero heap bytes, an M above it refused by name, and -- asserted in the
+   parent, because no rank can see its own divergence -- one slab offset across
+   all ranks. That last one is the invariant the whole design rests on: the RS
+   kernel addresses a peer as ``peer_base + (ptr - my_base)``, so a slab at a
+   different offset on some rank silently reads the wrong peer memory.
+
+``--only`` selects a subset; the full file is tens of minutes.
 
 Shapes are the GPT-OSS-120B MoE ``o_proj`` shapes: K=4096, N=2880, fp16, with
 ``M`` swept over decode/prefill sizes. Two extra shapes exist purely to hit the
@@ -43,6 +53,7 @@ Usage:
     python test_fused_gemm_reduce_scatter.py                 # TP 2/4/8, all shapes
     python test_fused_gemm_reduce_scatter.py -n 8            # TP 8 only
     python test_fused_gemm_reduce_scatter.py -s 2048,2880,4096
+    python test_fused_gemm_reduce_scatter.py -n 8 --only coverage
 """
 
 import argparse
@@ -1310,7 +1321,21 @@ def main():
         default=1 << 30,
         help="iris symmetric heap size in bytes (default: 1GB)",
     )
+    # Which suites to run. The full file sweeps correctness over the MNK matrix and
+    # then replays 128 graphs and 1024 unbarriered iterations per regime shape, which
+    # is tens of minutes -- long enough that on a preemptible queue it may never
+    # reach the end. Being able to ask for one suite is what makes the later ones
+    # runnable there at all, and it is also how you iterate on one of them.
+    parser.add_argument(
+        "--only",
+        type=str,
+        nargs="*",
+        choices=["correctness", "graph", "drift", "coverage"],
+        default=None,
+        help="run only these suites (default: all)",
+    )
     args = parser.parse_args()
+    want = set(args.only) if args.only else {"correctness", "graph", "drift", "coverage"}
 
     available = torch.cuda.device_count()
     tp_sizes = []
@@ -1330,6 +1355,8 @@ def main():
         for tp, (M, N, K), bias_mode in itertools.product(
             tp_sizes, args.mnk, args.bias
         ):
+            if "correctness" not in want:
+                break
             if M % tp or K % tp:
                 logger.warning(
                     "skipping M=%d N=%d K=%d at TP=%d: M and K must both be "
@@ -1343,7 +1370,8 @@ def main():
             rows.append(
                 test_gemm_reduce_scatter(tp, M, N, K, dtype, bias_mode, args.heap_size)
             )
-        summarize(
+        if rows:
+            summarize(
             f"gemm_reduce_scatter_m_shard / reduce_scatter_m_shard [{dtype}]", rows
         )
 
@@ -1359,12 +1387,15 @@ def main():
         ):
             if M % tp or K % tp:
                 continue
+            if "graph" not in want:
+                break
             rows.append(
                 test_graph_capture(
                     tp, M, N, K, dtype, bias_mode, GRAPH_REPLAYS, args.heap_size
                 )
             )
-        summarize(f"gemm_reduce_scatter_m_shard HIP-graph capture [{dtype}]", rows)
+        if rows:
+            summarize(f"gemm_reduce_scatter_m_shard HIP-graph capture [{dtype}]", rows)
 
         rows = []
         for tp, (M, N, K), bias_mode in itertools.product(
@@ -1372,22 +1403,26 @@ def main():
         ):
             if M % tp or K % tp:
                 continue
+            if "drift" not in want:
+                break
             rows.append(
                 test_unbarriered_drift(
                     tp, M, N, K, dtype, bias_mode, DRIFT_ITERS, args.heap_size
                 )
             )
-        summarize(f"gemm_reduce_scatter_m_shard unbarriered drift [{dtype}]", rows)
+        if rows:
+            summarize(f"gemm_reduce_scatter_m_shard unbarriered drift [{dtype}]", rows)
 
         # Shape coverage is a property of (N, dtype, tp), not of M -- M is exactly
         # what it sweeps internally -- so it runs once per TP on the regime N/K.
         rows = []
         _, cov_n, cov_k = regime_shapes[0]
         for tp in tp_sizes:
-            if cov_k % tp:
+            if "coverage" not in want or cov_k % tp:
                 continue
             rows.append(test_shape_coverage(tp, cov_n, cov_k, dtype))
-        summarize(f"gemm_reduce_scatter_m_shard shape coverage [{dtype}]", rows)
+        if rows:
+            summarize(f"gemm_reduce_scatter_m_shard shape coverage [{dtype}]", rows)
 
 
 if __name__ == "__main__":
