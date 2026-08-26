@@ -24,12 +24,26 @@ Capture safety
 --------------
 Every *symmetric-heap* allocation is collective (host barrier + heap-base
 all-gather) and Iris never frees, so all heap allocation is confined to
-``init_iris()`` / ``warmup_buffers()`` / a cache miss. Those must be called
-collectively on all ranks *before* graph capture. The steady-state call is a
-couple of dict lookups, an ordinary ``torch.empty`` for the output, a
-``torch.mm``/``torch.addmm`` into the cached heap buffer, up to two 1-element
-``dist.all_reduce`` sync tokens and the Triton RS launch -- no *collective*
+``init_iris()`` and ``warmup_buffers()``, which must be called collectively on
+all ranks *before* graph capture. A run-time cache miss allocates nothing: it
+takes a row-prefix view of the staging slab warmup already reserved for the
+scheduler's whole M range (see "Heap sizing" below). It still JIT-compiles the
+RS kernel for that specialization, which capture forbids, so a miss inside a
+capture region is refused -- but outside one it is cheap and expected. The
+steady-state call is a couple of dict lookups, an ordinary ``torch.empty`` for
+the output, a ``torch.mm``/``torch.addmm`` into the cached heap buffer, up to two
+1-element ``dist.all_reduce`` sync tokens and the Triton RS launch -- no
 allocation, no host sync, no device query.
+
+Heap sizing
+-----------
+The symmetric heap is sized from the workload, not fixed. See the block comment
+above ``_HEAP_ALIGNMENT`` for the failure that motivated it, why enumerating the
+scheduler's shapes is impossible, and why one slab per (N, dtype) with per-shape
+views is the answer. The entry points are ``heap_bytes_required()`` (pure
+arithmetic, callable before the context exists), ``init_iris(heap_size=...)`` and
+``warmup_buffers(max_m=...)``; ``AITER_GEMM_RS_HEAP_BYTES`` overrides the
+derivation, and every number is printed at warmup.
 
 The per-call ``torch.empty`` for the output is deliberate and is capture-legal:
 ordinary caching-allocator requests made during capture are served from the
@@ -199,6 +213,73 @@ def _heap_offset():
 IRIS_INSTANCE = None
 _CACHED_NUM_SMS = None  # cached SM count to avoid a host query during graph capture
 
+# --- symmetric-heap sizing, derived from the workload ------------------------
+#
+# THE FAILURE THIS REPLACES. The heap used to be a fixed 1 GiB (a default argument
+# here, called with no argument from vLLM's pass_manager), and every distinct M got
+# its own ``ctx.zeros((M, N))``. The iris allocator is a BUMP allocator that never
+# frees, so each prefill width the scheduler invented consumed M*N*itemsize forever.
+# On Qwen2.5-72B TP=8 that killed the server a few requests in:
+#
+#     [Iris] TorchAllocator: OOM requested=21889024 available=12582912
+#
+# Enumerating every M the scheduler can produce is not an option: M is any multiple
+# of the TP size up to ``max_num_batched_tokens``, and one buffer each would need
+# sum(M)*N*itemsize -- 68 GiB at max_num_batched_tokens=8192, N=8192, bf16.
+#
+# THE FIX. One SLAB per (N, dtype, world_size), sized for the largest M the
+# scheduler can hand the op, and every shape is a row-prefix VIEW of it. Cost drops
+# from O(sum of M) to O(M_max) -- 128 MiB for the case above -- and it covers every
+# M <= M_max with no holes, so no shape can allocate at run time.
+#
+# The view is exactly as safe as a dedicated allocation: iris's reduce-scatter reads
+# the tensor's own shape and strides and translates addresses as
+# ``peer_base + (ptr - my_base)``. ``slab[:M]`` has ``data_ptr() == slab.data_ptr()``
+# and slabs are allocated collectively in the same order on every rank, so that
+# offset is rank-identical. Sharing one slab across different M is the same aliasing
+# argument the buffer cache already makes for sharing one buffer across layers: the
+# stream orders the calls, and the RAW/WAR guards extend that ordering across ranks.
+_HEAP_ALIGNMENT = 1024  # iris TorchAllocator.allocate()'s default alignment
+
+# Staging buffers per (N, dtype) slab set. ONE today.
+#
+# Task 3.1 (double-buffered staging) makes this 2 and is the reason sizing is
+# expressed as a multiplier rather than a number: bumping this constant re-derives
+# the heap instead of forcing a re-measurement. When 3.1 lands it must allocate TWO
+# SEPARATE M_max slabs and alternate between them -- not two prefix views of one
+# slab, which overlap and would defeat the WAR elimination that is the point of
+# double buffering.
+_STAGING_BUFFERS_PER_SHAPE = 1
+
+# Headroom for iris's own heap traffic: ``device_barrier`` allocates one
+# ``num_ranks``-element int32 flags tensor per process group (32 B at TP=8, rounded
+# to 1 KiB), and future iris versions may add more. 1 MiB is ~0.8% of a typical
+# derived requirement -- cheap insurance against an off-by-one-allocation refusal.
+_HEAP_SLACK_BYTES = 1 << 20
+
+# Only used when nobody derives a size. Kept so that callers predating the derived
+# path (op_tests, the evidence scripts) behave exactly as before.
+_DEFAULT_HEAP_BYTES = 1 << 30
+
+# Escape hatch, read at init. Set it when the derivation is wrong for a deployment
+# rather than editing code; the derived and effective values are both logged so the
+# override is visible in the job log.
+_HEAP_BYTES_ENV = "AITER_GEMM_RS_HEAP_BYTES"
+
+# The largest M any staging slab must cover, declared by the caller that knows the
+# scheduler's ceiling (vLLM's pass_manager passes max_num_batched_tokens). 0 means
+# "not declared": slabs are then sized to the largest M actually seen, which is the
+# pre-slab behaviour and is what the op_tests and evidence scripts get.
+_MAX_M = 0
+
+# (N, dtype, world_size) -> the (rows, N) symmetric-heap slab every M views into.
+_SLABS = {}
+
+# Set once warmup_buffers() has run. After that, a *new* (N, dtype) slab is heap the
+# capacity check never budgeted for, which is a different and worse event than an
+# unwarmed M -- so it is warned about separately.
+_WARMUP_DONE = False
+
 # Cached across calls to avoid per-call *collective* allocation. Keyed by
 # (M, N, dtype) so that layers with different N do not trigger a symmetric-heap
 # allocation during capture. Value is a flat tuple so the hot path is a single
@@ -253,7 +334,69 @@ _AUTO_CONFIG = {
 _DEFAULT_CONFIG = (64, 64, 64, 4)
 
 
-def init_iris(heap_size: int = 1 << 30, ctx=None):
+def _align_up(n: int, to: int = _HEAP_ALIGNMENT) -> int:
+    return -(-n // to) * to
+
+
+def heap_bytes_required(
+    max_m: int,
+    n_values,
+    dtypes,
+    world_size: int = 1,
+    buffers_per_shape: int | None = None,
+) -> int:
+    """Symmetric-heap bytes this op needs to cover every M up to ``max_m``.
+
+    One staging slab per (N, dtype), each ``max_m`` rows tall, times the number of
+    buffers a slab set needs (see ``_STAGING_BUFFERS_PER_SHAPE``), plus headroom for
+    iris's own allocations. Pure arithmetic: no device, no iris, no side effects, so
+    a caller can size the heap *before* creating the context.
+
+    ``world_size`` is not a term -- every rank stages the full (M, N) partial and the
+    reduce-scatter is what shards it -- but it is accepted so the signature matches
+    everything else here and so the log line can name it.
+
+    Args:
+        max_m: Largest M the scheduler can hand the op. For vLLM that is
+            ``max_num_batched_tokens`` rounded up to a multiple of the TP size.
+        n_values: The N dimensions in play (the model's hidden size, for
+            sequence-parallel residual reduce-scatter).
+        dtypes: The dtypes in play. Two dtypes cost two slabs per N, because the
+            buffer cache is keyed on ``x.dtype``.
+        world_size: TP size, for the log line only.
+        buffers_per_shape: Override for ``_STAGING_BUFFERS_PER_SHAPE``; used to ask
+            "what would this cost after task 3.1".
+
+    Returns:
+        Bytes. Includes ``_HEAP_SLACK_BYTES``.
+    """
+    if buffers_per_shape is None:
+        buffers_per_shape = _STAGING_BUFFERS_PER_SHAPE
+    per_shape = 0
+    for n in sorted(set(n_values)):
+        for d in dtypes:
+            itemsize = torch.tensor([], dtype=d).element_size()
+            per_shape += _align_up(int(max_m) * int(n) * itemsize)
+    return per_shape * buffers_per_shape + _HEAP_SLACK_BYTES
+
+
+def _env_heap_bytes():
+    """``AITER_GEMM_RS_HEAP_BYTES`` as an int, or None. Never raises."""
+    raw = (os.environ.get(_HEAP_BYTES_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw, 0)
+    except ValueError:
+        print(f"⚠ {_HEAP_BYTES_ENV}={raw!r} is not an integer; ignoring it.")
+        return None
+    if value <= 0:
+        print(f"⚠ {_HEAP_BYTES_ENV}={value} is not positive; ignoring it.")
+        return None
+    return value
+
+
+def init_iris(heap_size: int | None = None, ctx=None):
     """Pre-initialize (or adopt) the iris context for the reduce-scatter ops.
 
     This MUST be called collectively on ALL ranks before any of these ops
@@ -266,8 +409,12 @@ def init_iris(heap_size: int = 1 << 30, ctx=None):
     that one is adopted instead of creating a second.
 
     Args:
-        heap_size: Symmetric heap size in bytes. Default 1GB. Ignored when a
-            context is adopted or supplied.
+        heap_size: Symmetric heap size in bytes. **Pass a value derived from the
+            workload** -- ``heap_bytes_required(...)`` -- rather than relying on the
+            fallback. None means ``_DEFAULT_HEAP_BYTES``, which is the fixed 1 GiB
+            that made the original exhaustion a week-long mystery; it is kept only
+            so callers predating the derived path behave as before, and it says so
+            in the log. ``AITER_GEMM_RS_HEAP_BYTES`` overrides either.
         ctx: An existing iris context to adopt. Takes priority over everything
             else.
 
@@ -290,20 +437,108 @@ def init_iris(heap_size: int = 1 << 30, ctx=None):
     sibling_ctx = _sibling_iris_instance()
     if sibling_ctx is not None:
         IRIS_INSTANCE = sibling_ctx
+        # The adopted heap was sized by the all-reduce fusion, which knows nothing
+        # about this op's shapes, so `heap_size` is dropped on the floor here. Say so
+        # -- silently ignoring a derived size is how the original bug hid. Whether
+        # the adopted heap is actually big enough is decided by
+        # `_check_heap_capacity()` at warmup, against the real numbers.
         print(
             "✓ Iris context for fused GEMM+RS adopted from fused_gemm_all_reduce "
-            "(one symmetric heap shared by both fusions)"
+            "(one symmetric heap shared by both fusions). NOTE: the adopted heap "
+            f"is {_heap_total() or 0} bytes, sized by that fusion; the "
+            f"heap_size={heap_size} requested here is ignored. warmup_buffers() "
+            "will refuse if it is too small."
         )
         return IRIS_INSTANCE
 
-    IRIS_INSTANCE = iris.iris(heap_size=heap_size)
+    derived = heap_size
+    override = _env_heap_bytes()
+    effective = override if override is not None else heap_size
+    if effective is None:
+        effective = _DEFAULT_HEAP_BYTES
+
+    IRIS_INSTANCE = iris.iris(heap_size=effective)
     _publish_iris_instance(IRIS_INSTANCE)
+    if override is not None:
+        source = f"{_HEAP_BYTES_ENV} override (derived was {derived})"
+    elif derived is not None:
+        source = "derived from the workload"
+    else:
+        source = (
+            "FALLBACK DEFAULT -- no caller derived a size, so this heap is not "
+            "sized for any particular workload"
+        )
     print(
         f"✓ Iris context initialized for fused GEMM+RS: "
         f"rank {IRIS_INSTANCE.get_rank()}/{IRIS_INSTANCE.get_num_ranks()}, "
-        f"heap={heap_size / (1 << 20):.0f}MB"
+        f"heap={effective} B ({effective / (1 << 20):.0f} MiB), {source}"
     )
     return IRIS_INSTANCE
+
+
+def _heap_total():
+    """Total bytes of the symmetric heap, or None. Never raises."""
+    try:
+        return int(IRIS_INSTANCE.heap.allocator.heap_size)
+    except Exception:
+        return None
+
+
+def _heap_base():
+    """Local base address of the symmetric heap, or None. Never raises."""
+    try:
+        return int(IRIS_INSTANCE.heap.allocator.get_base_address())
+    except Exception:
+        return None
+
+
+def _check_slab_offset_agreement(slab, N: int, dtype, world_size: int) -> None:
+    """Verify every rank put this slab at the SAME heap offset. Collective.
+
+    This is the invariant the whole slab-and-view design rests on, and it is
+    invisible to any single-rank test.
+
+    The RS kernel reads a peer's staging buffer as ``peer_base + (ptr - my_base)``
+    -- it never learns the peer's actual pointer. So a row-prefix view ``slab[:M]``
+    resolves to the right memory on a peer if and only if that peer's slab sits at
+    the same offset into ITS heap. It does, because iris's allocator is a bump
+    allocator and every rank runs the identical allocation sequence: the shape set
+    is derived from the same model config, deduplicated and then SORTED, so the warm
+    loop visits shapes in the same order everywhere; ``_create_entry`` (which
+    allocates the slab) runs before ``_warm_both_sync_impls`` (which allocates the
+    barrier flags) on every rank; and iris never frees, so an offset can never be
+    reused out of order.
+
+    That is an argument, though, and the failure it guards against is silent: a rank
+    whose slab is 1 KiB further along would read a shifted window of every peer's
+    partial sums and produce plausible-looking wrong numbers with no fault. So the
+    argument is checked rather than trusted. One all-reduce at warmup, where a
+    collective is free.
+
+    Encoded as ``(offset, -offset)`` reduced with MAX for the same reason
+    ``_check_sync_mode_agreement`` does it: MAX alone cannot tell "everyone agrees
+    on 4096" from "someone else said 4096".
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    base = _heap_base()
+    if base is None:
+        return
+    mine = int(slab.data_ptr()) - base
+    t = torch.tensor([mine, -mine], dtype=torch.int64, device=slab.device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    got = [int(v) for v in t]
+    if got != [mine, -mine]:
+        raise RuntimeError(
+            f"fused GEMM+RS: the staging slab for (N={N}, dtype={dtype}, "
+            f"world_size={world_size}) is at heap offset {mine} on this rank but not "
+            f"on every rank (max seen {got[0]}, min seen {-got[1]}). The "
+            f"reduce-scatter addresses a peer's staging as peer_base + (ptr - "
+            f"my_base), so mismatched offsets make every rank read the WRONG peer "
+            f"memory and return plausible but wrong results with no fault. The ranks "
+            f"have diverged in allocation order: warmup must be called collectively, "
+            f"with the same shapes and dtypes, before anything else touches the heap."
+        )
 
 
 def _publish_iris_instance(ctx) -> None:
@@ -459,11 +694,16 @@ def _check_divisible(M: int, world_size: int) -> None:
 def _refuse_if_capturing(M: int, N: int, dtype) -> None:
     """Fail loudly rather than deadlocking if a cache miss happens mid-capture.
 
-    Filling a cache entry is collective (``ctx.zeros`` bottoms out in a host
-    ``dist.barrier()``), and a miss is rank-local, so a miss during capture either
+    Filling a cache entry JIT-compiles the RS kernel for that specialization, which
+    is not capture-safe, and -- if the (N, dtype) slab does not exist yet -- performs
+    a collective ``ctx.zeros``. A miss is rank-local, so the collective case either
     hangs on peers that are not capturing or diverges the collective count across
     ranks. Both present as an unexplained hang; this turns them into a message
     naming the shape that was not warmed.
+
+    Since the slabs cover every M up to the declared ceiling, reaching this inside a
+    capture region means a shape vLLM captured was not warmed -- a genuine bug in
+    the caller's warm set, not the heap running out.
     """
     try:
         capturing = torch.cuda.is_current_stream_capturing()
@@ -472,19 +712,108 @@ def _refuse_if_capturing(M: int, N: int, dtype) -> None:
     if capturing:
         raise RuntimeError(
             f"fused GEMM+RS: cache miss for (M={M}, N={N}, dtype={dtype}) during "
-            f"CUDA/HIP graph capture. Filling the cache is collective and would "
-            f"deadlock. Warm this shape before capture via "
+            f"CUDA/HIP graph capture. Filling the cache JIT-compiles the kernel, "
+            f"which capture forbids. Every CAPTURED shape must be warmed: pass it in "
             f"warmup_buffers(compile_sizes=..., weight_shapes=...) or register_shape()."
         )
 
 
-def _create_entry(M: int, N: int, dtype: torch.dtype, world_size: int):
-    """Allocate the cache entry for (M, N, dtype). COLLECTIVE -- never on the hot path.
+def declare_max_m(max_m: int) -> None:
+    """Declare the largest M the scheduler can hand these ops.
 
-    ``ctx.zeros`` ends in a host ``dist.barrier()`` plus a heap-base all-gather,
-    and Iris never frees, so this must run at warmup only: it is not legal
-    during graph capture and it leaks ``M*N*itemsize`` per call if it is not
-    hoisted out of the loop.
+    Sizing and coverage both key off this one number, which is what keeps them from
+    drifting apart: ``heap_bytes_required(max_m, ...)`` reserves exactly the slab the
+    staging views are cut from, so any M the slab can hold is a shape the heap was
+    sized for, by construction.
+
+    Callers that do not know their ceiling may skip this; slabs are then sized to the
+    largest M actually seen, which is what the op_tests and the evidence scripts do.
+    """
+    global _MAX_M
+    _MAX_M = max(_MAX_M, int(max_m))
+
+
+def _get_slab(N: int, dtype: torch.dtype, world_size: int, M: int):
+    """The (rows, N) staging slab for (N, dtype), allocating it if absent. COLLECTIVE.
+
+    ``ctx.zeros`` ends in a host ``dist.barrier()`` plus a heap-base all-gather and
+    Iris never frees, so this must run at warmup: it is not legal during graph
+    capture. Every M is a row-prefix view of what this returns, so it runs at most
+    once per (N, dtype, world_size) when a ceiling has been declared.
+    """
+    key = (N, dtype, world_size)
+    slab = _SLABS.get(key)
+    if slab is not None and M <= slab.shape[0]:
+        return slab
+
+    if _MAX_M and M > _MAX_M:
+        # The scheduler exceeded the ceiling the heap was sized from. Refuse rather
+        # than allocate: growing the heap on the hot path is the never-freeing
+        # bump-allocator failure this whole design exists to remove, and the real
+        # defect is that the declared ceiling is wrong.
+        raise RuntimeError(
+            f"fused GEMM+RS: M={M} exceeds the declared ceiling M_max={_MAX_M} for "
+            f"(N={N}, dtype={dtype}, world_size={world_size}). The symmetric heap was "
+            f"sized for {_MAX_M} rows and nothing larger can be staged without "
+            f"allocating mid-forward. Raise the ceiling (vLLM: "
+            f"max_num_batched_tokens) so the heap is re-derived from it, or cap the "
+            f"scheduler at {_MAX_M} tokens."
+        )
+
+    if slab is None and _WARMUP_DONE:
+        # An N that warmup never saw, so `_check_heap_capacity` never budgeted for
+        # it. This DOES allocate on the never-freeing heap. It cannot happen in the
+        # vLLM path (sequence parallelism reduce-scatters only the residual stream,
+        # so there is exactly one N, and warmup is told it) -- but if it ever does,
+        # the heap can be exhausted again and the log must say why.
+        print(
+            f"⚠ fused GEMM+RS: allocating a staging slab for (N={N}, dtype={dtype}) "
+            f"AFTER warmup. This N was not in the warm set, so the heap budget did "
+            f"not include it: {max(_MAX_M, M)} x {N} more bytes are being taken from "
+            f"a heap that never frees. Declare this N at warmup "
+            f"(warmup_buffers(weight_shapes=...) or register_shape())."
+        )
+
+    rows = max(_MAX_M, M)
+    iris_inst = _get_iris()
+    if _TRACE_ALLOC:
+        _off_before = _heap_offset()
+        _t0 = time.perf_counter()
+        _trace(
+            f"ALLOC begin M={rows} N={N} dtype={dtype} world={world_size} "
+            f"heap_offset_before={_off_before}"
+        )
+    new_slab = iris_inst.zeros((rows, N), dtype=dtype)
+    if _TRACE_ALLOC:
+        _trace(
+            f"ALLOC end   M={rows} N={N} heap_offset_after={_heap_offset()} "
+            f"wall_ms={(time.perf_counter() - _t0) * 1e3:.2f} "
+            f"staging_ptr=0x{new_slab.data_ptr():x}"
+        )
+    if slab is not None:
+        # The slab outgrew itself: either no ceiling was declared and M got bigger,
+        # or the ceiling was raised after this slab was built. The old slab cannot be
+        # freed (bump allocator) and existing cache entries keep viewing it, which
+        # stays correct -- but it is wasted heap.
+        print(
+            f"⚠ fused GEMM+RS: grew the (N={N}, dtype={dtype}) staging slab from "
+            f"{slab.shape[0]} to {rows} rows (M_max="
+            f"{_MAX_M or 'undeclared'}). The old slab cannot be reclaimed; declare "
+            f"the ceiling once, before warmup, to avoid paying for both."
+        )
+    # Before the slab is used for anything, and before it is cached: a divergent
+    # offset must not survive to become wrong numbers.
+    _check_slab_offset_agreement(new_slab, N, dtype, world_size)
+    _SLABS[key] = new_slab
+    return new_slab
+
+
+def _create_entry(M: int, N: int, dtype: torch.dtype, world_size: int):
+    """Build the cache entry for (M, N, dtype) as a view of the (N, dtype) slab.
+
+    Collective only when the slab does not exist yet; after that this is a reshape
+    and a dict store. Never legal during graph capture regardless, because the RS
+    kernel is JIT-compiled per specialization and that is not capture-safe either.
     """
     global _SYNC_TENSOR
 
@@ -498,25 +827,19 @@ def _create_entry(M: int, N: int, dtype: torch.dtype, world_size: int):
 
     _cache_num_sms(device)
 
-    # Only the (M, N) staging buffer has to be on the symmetric heap: the RS
-    # kernel translates addresses as `peer_base + (ptr - my_base)`, so it can
-    # only pull from a heap pointer. The output is an ordinary torch tensor,
-    # allocated fresh per call.
-    if _TRACE_ALLOC:
-        _off_before = _heap_offset()
-        _t0 = time.perf_counter()
-        _trace(
-            f"ALLOC begin M={M} N={N} dtype={dtype} world={world_size} "
-            f"heap_offset_before={_off_before}"
-        )
-        staging = iris_inst.zeros((M, N), dtype=dtype)
-        _trace(
-            f"ALLOC end   M={M} N={N} heap_offset_after={_heap_offset()} "
-            f"wall_ms={(time.perf_counter() - _t0) * 1e3:.2f} "
-            f"staging_ptr=0x{staging.data_ptr():x}"
-        )
-    else:
-        staging = iris_inst.zeros((M, N), dtype=dtype)
+    # Only the staging buffer has to be on the symmetric heap: the RS kernel
+    # translates addresses as `peer_base + (ptr - my_base)`, so it can only pull from
+    # a heap pointer. The output is an ordinary torch tensor, allocated fresh per
+    # call.
+    #
+    # `slab[:M]` is exactly (M, N) and contiguous. The shape must be exact: the GEMM
+    # writes it with `out=`, and `out=` on a mismatched shape RESIZES -- which would
+    # silently replace the heap buffer with a fresh off-heap allocation on the hot
+    # path and make every peer read garbage without raising.
+    staging = _get_slab(N, dtype, world_size, M)[:M]
+    assert tuple(staging.shape) == (M, N), (
+        f"staging view is {tuple(staging.shape)}, expected {(M, N)}"
+    )
 
     if _SYNC_TENSOR is None:
         _SYNC_TENSOR = torch.zeros(1, dtype=torch.int32, device=device)
@@ -526,6 +849,29 @@ def _create_entry(M: int, N: int, dtype: torch.dtype, world_size: int):
     )
     _BUFFER_CACHE[(M, N, dtype, world_size)] = entry
     return entry
+
+
+def _entry_on_miss(M: int, N: int, dtype, world_size: int, group_name: str, op: str):
+    """Fill the buffer cache from the hot path, LOUDLY. Not on the fast path.
+
+    Task 3 Step 3 of the iris-heap plan: it is not possible to enumerate every M the
+    scheduler can produce -- M is any multiple of the TP size up to
+    ``max_num_batched_tokens`` -- so a miss is expected and must be *deliberate and
+    logged* rather than silent. Since the slab already covers every M up to the
+    declared ceiling, what a miss now costs is a Triton JIT for that specialization,
+    not a symmetric-heap allocation. One line per distinct shape (the second call
+    hits the cache), so this cannot flood a log.
+    """
+    print(
+        f"ℹ fused GEMM+RS: buffer-cache miss for (M={M}, N={N}, dtype={dtype}, "
+        f"world_size={world_size}) on the {op} path -- a shape warmup did not cover. "
+        f"Filling it now: a view of the pre-allocated staging slab plus a Triton JIT "
+        f"for this specialization. No symmetric-heap allocation, provided "
+        f"M <= M_max={_MAX_M or 'undeclared'}. Legal here because this call is not "
+        f"inside a graph capture region."
+    )
+    _check_iris_world_size(world_size, group_name)
+    return _create_entry(M, N, dtype, world_size)
 
 
 def _cache_num_sms(device) -> None:
@@ -703,8 +1049,61 @@ def _check_sync_mode_agreement() -> None:
         )
 
 
+class HeapTooSmallError(RuntimeError):
+    """The symmetric heap cannot hold the staging this deployment needs.
+
+    A distinct type, not a bare RuntimeError, because callers must be able to treat
+    it differently from every other warmup failure. vLLM's pass manager wraps warmup
+    in a broad ``except Exception`` so that a broken iris degrades instead of killing
+    the server -- which is right for an import error, and exactly wrong for this:
+    by the time warmup runs, the fusion pass has already put the fused op in the
+    graph, so degrading is not available. Swallowing this would turn a diagnosable
+    startup refusal back into the mid-request OOM the refusal exists to prevent.
+    """
+
+
+def _check_heap_capacity(max_m: int, n_values, dtypes, world_size: int) -> int:
+    """Refuse at warmup if the heap cannot hold the staging slabs. Returns the need.
+
+    Task 2 Step 3: fail loudly and early. A server that starts and dies on request
+    three costs a node-hour and a day of confusion; a refusal at warmup naming the
+    four numbers costs nothing and diagnoses itself. This is also what catches an
+    adopted sibling heap (see ``init_iris``), which was sized by a different fusion.
+    """
+    need = heap_bytes_required(max_m, n_values, dtypes, world_size)
+    total = _heap_total()
+    used = _heap_offset()
+    if total is None or used is None:
+        # A non-bump allocator has no offset to read. Do not invent a refusal.
+        print(
+            f"⚠ fused GEMM+RS: cannot read the heap's size/offset, so the capacity "
+            f"check is skipped. Needed {need} B for M_max={max_m}, "
+            f"N={sorted(set(n_values))}, dtypes={[str(d) for d in dtypes]}."
+        )
+        return need
+    free = total - used
+    if need > free:
+        raise HeapTooSmallError(
+            f"fused GEMM+RS: the iris symmetric heap is too small. Staging needs "
+            f"{need} B ({need / (1 << 20):.1f} MiB) for M_max={max_m}, "
+            f"N={sorted(set(n_values))}, dtypes={[str(d) for d in dtypes]}, "
+            f"{_STAGING_BUFFERS_PER_SHAPE} buffer(s)/shape at world_size={world_size}; "
+            f"the heap is {total} B ({total / (1 << 20):.1f} MiB) with {free} B "
+            f"({free / (1 << 20):.1f} MiB) free. Refusing to start a server that "
+            f"would die mid-request. Fix by deriving the heap from the same numbers "
+            f"(heap_bytes_required(...) into init_iris(heap_size=...)), by setting "
+            f"{_HEAP_BYTES_ENV}={need}, or by lowering the token ceiling that "
+            f"produced M_max={max_m}."
+        )
+    return need
+
+
 def warmup_buffers(
-    compile_sizes=None, weight_shapes=None, dtype=None, group_name: str = ""
+    compile_sizes=None,
+    weight_shapes=None,
+    dtype=None,
+    group_name: str = "",
+    max_m: int | None = None,
 ):
     """Pre-allocate buffers and run a full dummy iteration. Call collectively, pre-capture.
 
@@ -724,6 +1123,28 @@ def warmup_buffers(
             explicit dtype to halve the heap footprint.
         group_name: TP process group name, used to derive the world size. Empty
             falls back to the iris communicator.
+        max_m: The largest M the scheduler can ever hand these ops -- for vLLM,
+            ``max_num_batched_tokens`` rounded up to a multiple of the TP size. The
+            staging slabs are sized for it, so **every** M up to it is covered, not
+            just the warmed ones, and the heap the caller derived from
+            ``heap_bytes_required(max_m, ...)`` is exactly the heap the slabs need.
+            None means "size the slabs to the largest warmed M", which is right for
+            fixed-shape callers (op_tests, the evidence scripts) and wrong for a
+            scheduler: an M above the largest warmed one is then an allocation.
+
+    Shape coverage, and what happens on a miss
+    ------------------------------------------
+    The warmed set cannot be the set of shapes the scheduler produces -- there are
+    ``max_num_batched_tokens / tp`` of them and one buffer each would need tens of
+    GiB. What the warmed set buys is the *Triton JIT*: every warmed (M, N, dtype)
+    compiles its specialization here, and every shape vLLM captures into a graph is
+    warmed, so no captured path can miss.
+
+    An unwarmed M is therefore expected on the eager prefill path, and is handled,
+    not prevented: ``_entry_on_miss`` takes a view of the already-allocated slab and
+    JIT-compiles that specialization, logging one line. It allocates nothing on the
+    symmetric heap, so it cannot exhaust it. Above ``max_m`` there is no slab to view
+    and the op raises with the numbers rather than allocating.
 
     No-argument behaviour
     ---------------------
@@ -739,6 +1160,8 @@ def warmup_buffers(
     ``compile_sizes``/``weight_shapes`` or call ``register_shape()`` first; a
     loud warning says so.
     """
+    global _WARMUP_DONE
+
     iris_inst = _get_iris()
     device = iris_inst.get_device()
     _cache_num_sms(device)
@@ -777,6 +1200,21 @@ def warmup_buffers(
             "illegal inside a HIP graph capture region. Pass compile_sizes and "
             "weight_shapes, or call register_shape() before warmup."
         )
+
+    # Sizing and coverage from ONE number. Everything below -- the capacity refusal,
+    # the slab rows, and therefore which M can be served without allocating -- is
+    # derived from `slab_m`, so the two cannot drift apart the way "warm the capture
+    # sizes" and "hardcode 1 GiB" did.
+    usable = [(M, N, d) for (M, N, d) in shapes if M % world_size == 0]
+    slab_m = max([m for m, _, _ in usable] + [int(max_m or 0)])
+    # Declared unconditionally, not only when the caller passed max_m: without it the
+    # warm loop would size the first slab to the smallest M and then grow it once per
+    # shape, allocating (and stranding) 48 slabs on the never-freeing heap.
+    declare_max_m(slab_m)
+    n_values = sorted({n for _, n, _ in usable}) or [_DEFAULT_WARMUP_PROBE[1]]
+
+    # Before anything is allocated, so a refusal costs nothing and names the numbers.
+    need = _check_heap_capacity(slab_m, n_values, dtypes, world_size)
 
     warmed = 0
     skipped = []
@@ -818,6 +1256,31 @@ def warmup_buffers(
         f"pre-allocated {warmed} buffer(s), {len(_BUFFER_CACHE)} cached"
         + (f", skipped {skipped} (M not divisible by {world_size})" if skipped else "")
     )
+
+    # The heap budget, in the job log, every run. A fixed 1 GiB that nothing printed
+    # is what turned this failure into a week of guessing; a line that states what
+    # was needed, what was taken and what is left makes the next one self-diagnosing.
+    total, used = _heap_total(), _heap_offset()
+    slab_bytes = sum(int(s.numel()) * s.element_size() for s in _SLABS.values())
+    after_31 = heap_bytes_required(
+        slab_m, n_values, dtypes, world_size, buffers_per_shape=2
+    )
+    print(
+        f"✓ Iris GEMM+RS heap: M_max={slab_m} N={n_values} "
+        f"dtypes={[str(d) for d in dtypes]} buffers/shape={_STAGING_BUFFERS_PER_SHAPE} "
+        f"-> required={need} B ({need / (1 << 20):.1f} MiB); "
+        f"{len(_SLABS)} staging slab(s) hold {slab_bytes} B "
+        f"({slab_bytes / (1 << 20):.1f} MiB); "
+        f"heap total={total} used={used}"
+        + (
+            f" ({100.0 * used / total:.1f}%), free={(total - used) / (1 << 20):.1f} MiB"
+            if total and used is not None
+            else ""
+        )
+        + f"; after task 3.1 (2 buffers/shape) this would need {after_31} B "
+        f"({after_31 / (1 << 20):.1f} MiB)"
+    )
+    _WARMUP_DONE = True
 
 
 def _check_gemm_inputs(x: torch.Tensor, weights: list[torch.Tensor]) -> torch.Tensor:
@@ -909,9 +1372,8 @@ def gemm_reduce_scatter_m_shard_wrapper(
     # --- hot path: dict lookups, output alloc, GEMM into the heap buffer, RS ---
     entry = _BUFFER_CACHE.get((M, N, x.dtype, world_size))
     if entry is None:
-        _check_iris_world_size(world_size, group_name)
-        # Collective; capture-unsafe (warmup only).
-        entry = _create_entry(M, N, x.dtype, world_size)
+        # Capture-unsafe (Triton JIT); deliberate and logged outside capture.
+        entry = _entry_on_miss(M, N, x.dtype, world_size, group_name, "fused")
     staging, sync_tensor, M_local, device, block_m, block_n, num_sms, num_warps = entry
 
     # Fresh, never cached: these ops are registered as pure, so a shared output
@@ -1018,9 +1480,8 @@ def reduce_scatter_m_shard_wrapper(
     # --- hot path: dict lookups, output alloc, copy into the heap buffer, RS ---
     entry = _BUFFER_CACHE.get((M, N, x.dtype, world_size))
     if entry is None:
-        _check_iris_world_size(world_size, group_name)
-        # Collective; capture-unsafe (warmup only).
-        entry = _create_entry(M, N, x.dtype, world_size)
+        # Capture-unsafe (Triton JIT); deliberate and logged outside capture.
+        entry = _entry_on_miss(M, N, x.dtype, world_size, group_name, "standalone")
     staging, sync_tensor, M_local, device, block_m, block_n, num_sms, num_warps = entry
 
     # Fresh, never cached -- see gemm_reduce_scatter_m_shard_wrapper.
@@ -1145,6 +1606,9 @@ __all__ = [
     "reduce_scatter_m_shard_wrapper",
     "reduce_scatter_m_shard_fake",
     "init_iris",
+    "heap_bytes_required",
+    "declare_max_m",
+    "HeapTooSmallError",
     "register_shape",
     "warmup_buffers",
 ]
