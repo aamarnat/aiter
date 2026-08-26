@@ -776,6 +776,188 @@ def _worker_drift(tp_size, gpu_id, cfg):
         aiter.destroy_dist_env()
 
 
+def _worker_coverage(tp_size, gpu_id, cfg):
+    """Prove the staging heap is sized from a ceiling, not from the shapes warmed.
+
+    The failure this guards: the op used to allocate one ``(M, N)`` symmetric-heap
+    buffer per distinct M, on a bump allocator that never frees. A server whose
+    scheduler invented new prefill widths therefore exhausted the heap and died --
+    ``TorchAllocator: OOM requested=21889024 available=12582912`` on Qwen2.5-72B
+    TP=8, a few requests in. Warming more shapes could not fix it: with one buffer
+    each, covering every M up to a 8192-token budget at N=8192 bf16 needs 68 GiB.
+
+    So the contract under test is not "every shape is warmed" -- it cannot be --
+    but "no shape allocates":
+
+      1. warmup builds exactly ONE staging slab per (N, dtype, world_size),
+         ``M_max`` rows tall, whatever the warmed set is;
+      2. an UNWARMED M below the ceiling costs ZERO heap bytes and is still
+         numerically correct, because its staging is a row-prefix view of the slab;
+      3. an M ABOVE the ceiling raises, naming the ceiling, instead of allocating;
+      4. a ceiling the heap cannot hold is refused up front, not at request three.
+
+    Point 2 is the one that would have caught the original bug, and point 3 is what
+    makes the remaining coverage hole loud instead of fatal.
+    """
+    try:
+        device = torch.device(f"cuda:{gpu_id}")
+        torch.cuda.set_device(device)
+        aiter.init_dist_env(tp_size, gpu_id)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        N, K, dtype = cfg["N"], cfg["K"], cfg["dtype"]
+        K_local = K // world_size
+        # A ceiling well above anything warmed, so "warmed" and "coverable" are
+        # visibly different sets.
+        max_m = cfg["m_max_mult"] * world_size
+        warm_ms = [m * world_size for m in cfg["warm_mults"]]
+        unwarmed_m = cfg["unwarmed_mult"] * world_size
+        over_m = (cfg["m_max_mult"] + 1) * world_size
+        assert unwarmed_m not in warm_ms and unwarmed_m <= max_m
+
+        group_name = _register_group_name()
+
+        heap_need = FUSED_RS.heap_bytes_required(max_m, [N], [dtype], world_size)
+        FUSED_RS.init_iris(heap_size=heap_need)
+        for m in warm_ms:
+            FUSED_RS.register_shape(m, N, dtype)
+        FUSED_RS.warmup_buffers(dtype=dtype, group_name=group_name, max_m=max_m)
+
+        # (1) one slab, sized to the ceiling -- not one per warmed shape.
+        slabs = dict(getattr(FUSED_RS, "_SLABS", {}))
+        assert len(slabs) == 1, (
+            f"[rank {rank}] warmup built {len(slabs)} staging slab(s) for a single "
+            f"(N={N}, dtype={dtype}) and {len(warm_ms)} warmed M; it must build "
+            f"exactly one, or heap use grows with the number of shapes again"
+        )
+        slab = next(iter(slabs.values()))
+        assert tuple(slab.shape) == (max_m, N), (
+            f"[rank {rank}] slab is {tuple(slab.shape)}, expected {(max_m, N)}: the "
+            f"slab must be sized from the declared ceiling, not from the warmed set"
+        )
+        # Every warmed shape must be a view of that one slab, not its own buffer.
+        for m in warm_ms:
+            probe = _cache_probe(m, N, dtype, world_size)
+            assert probe.get("staging_ptr") == slab.data_ptr(), (
+                f"[rank {rank}] M={m} does not stage into the shared slab "
+                f"(ptr {probe.get('staging_ptr')} vs slab {slab.data_ptr()})"
+            )
+
+        heap_after_warmup = _symmetric_heap_offset()
+
+        # (2) an unwarmed M inside the ceiling: correct, and free.
+        xs, ws_nk, bias_full = _build_rank_inputs(
+            unwarmed_m, N, K_local, world_size, dtype, device, cfg["seed"]
+        )
+        ref = run_torch(xs, ws_nk, None, rank, world_size, dtype)
+        torch.cuda.synchronize()
+        dist.barrier()
+        out = torch.ops.aiter.gemm_reduce_scatter_m_shard(
+            xs[rank], [ws_nk[rank].t()], None, 0, group_name
+        )
+        torch.cuda.synchronize()
+        heap_after_miss = _symmetric_heap_offset()
+
+        miss_growth = None
+        if heap_after_warmup is not None:
+            miss_growth = heap_after_miss - heap_after_warmup
+            assert miss_growth == 0, (
+                f"[rank {rank}] an unwarmed M={unwarmed_m} (ceiling {max_m}) grew the "
+                f"symmetric heap by {miss_growth} B. That is the exhaustion bug: the "
+                f"heap never frees, so every new prefill width would leak until the "
+                f"engine dies."
+            )
+        miss_err = checkAllclose(
+            ref.to(torch.float32),
+            out.to(torch.float32),
+            rtol=RTOL,
+            atol=ATOL,
+            msg=f"[rank {rank}] unwarmed M={unwarmed_m}: shard vs torch ref",
+        )
+        assert miss_err <= MAX_ERR_RATIO, (
+            f"[rank {rank}] unwarmed M={unwarmed_m}: staging into a prefix view of "
+            f"the slab is not numerically equivalent to a dedicated buffer "
+            f"(err ratio {miss_err:.4f})"
+        )
+        assert _cache_probe(unwarmed_m, N, dtype, world_size).get(
+            "staging_ptr"
+        ) == slab.data_ptr(), (
+            f"[rank {rank}] the unwarmed M={unwarmed_m} entry does not view the slab"
+        )
+
+        # (3) above the ceiling: refuse, naming it. Never allocate.
+        over_x = torch.zeros(over_m, K_local, dtype=dtype, device=device)
+        over_w = torch.zeros(N, K_local, dtype=dtype, device=device)
+        refused = ""
+        try:
+            torch.ops.aiter.gemm_reduce_scatter_m_shard(
+                over_x, [over_w.t()], None, 0, group_name
+            )
+        except Exception as e:  # RuntimeError, possibly wrapped by the dispatcher
+            refused = str(e)
+        assert f"M_max={max_m}" in refused, (
+            f"[rank {rank}] M={over_m} above the ceiling {max_m} did not raise a "
+            f"message naming the ceiling; got: {refused[:400] or '<no exception>'}"
+        )
+        heap_after_refusal = _symmetric_heap_offset()
+        if heap_after_warmup is not None:
+            assert heap_after_refusal == heap_after_warmup, (
+                f"[rank {rank}] refusing M={over_m} still allocated "
+                f"{heap_after_refusal - heap_after_warmup} B on the heap"
+            )
+
+        # (4) a ceiling this heap cannot hold must be refused up front, and with a
+        # DISTINCT exception type: vLLM's pass manager swallows generic warmup
+        # failures so a broken iris degrades instead of killing the server, and this
+        # one must punch through that (see HeapTooSmallError's docstring).
+        raised, raised_type = "", None
+        try:
+            FUSED_RS._check_heap_capacity(max_m * 64, [N], [dtype], world_size)
+        except RuntimeError as e:
+            raised, raised_type = str(e), type(e)
+        assert raised_type is FUSED_RS.HeapTooSmallError, (
+            f"[rank {rank}] an unsatisfiable ceiling raised {raised_type} rather "
+            f"than HeapTooSmallError, so vLLM's broad except would swallow it and "
+            f"the server would start and die mid-request instead"
+        )
+        assert "too small" in raised, (
+            f"[rank {rank}] the refusal does not name the problem; got: "
+            f"{raised[:400]}"
+        )
+
+        # (5) the invariant the whole view design rests on: the slab must sit at the
+        # SAME heap offset on every rank, because the RS kernel addresses a peer's
+        # staging as peer_base + (ptr - my_base) and never learns the peer's real
+        # pointer. _get_slab checks this collectively, so reaching here already means
+        # it agreed -- but return the offset so the parent asserts it independently
+        # rather than trusting the op to police itself.
+        heap_base = FUSED_RS._heap_base()
+        slab_offset = None if heap_base is None else slab.data_ptr() - heap_base
+
+        res = {
+            "rank": rank,
+            "slab_offset": slab_offset,
+            "M_max": max_m,
+            "warmed": len(warm_ms),
+            "slabs": len(slabs),
+            "slab_B": int(slab.numel()) * slab.element_size(),
+            "derived_heap_B": heap_need,
+            "heap_after_warmup_B": heap_after_warmup,
+            "miss_growth_B": miss_growth,
+            "unwarmed_M": unwarmed_m,
+            "unwarmed_err": miss_err,
+        }
+        torch.cuda.synchronize()
+        return res
+
+    except Exception as e:
+        _log_worker_error(gpu_id, e)
+        raise
+    finally:
+        aiter.destroy_dist_env()
+
+
 # ---------------------------------------------------------------------------
 # parent-side plumbing
 # ---------------------------------------------------------------------------
@@ -956,6 +1138,57 @@ def test_graph_capture(tp_size, M, N, K, dtype, bias_mode, replays, heap_size):
     ret["torch mem growth B"] = max(r["torch_mem_growth_B"] for r in rows)
     ret["tail"] = _tail_note(rows)
     return ret
+
+
+@benchmark()
+def test_shape_coverage(tp_size, N, K, dtype):
+    """Heap sized from a ceiling; unwarmed shapes free; oversized shapes refused.
+
+    No ``heap_size`` argument on purpose: the heap this test runs on is *derived*
+    from the ceiling by ``heap_bytes_required``, which is the behaviour under test.
+    Passing ``--heap_size`` here would test the constant that caused the bug.
+    """
+    cfg = {
+        "N": N,
+        "K": K,
+        "dtype": dtype,
+        # Per-rank multipliers, so every M is divisible by the world size.
+        "m_max_mult": 256,
+        "warm_mults": [4, 16, 64],
+        "unwarmed_mult": 37,
+        "seed": 42,
+    }
+    rows = _spawn(_worker_coverage, tp_size, cfg)
+    r0 = rows[0]
+
+    # Checked here, across ranks, as well as inside the op. A per-rank assertion
+    # cannot see a cross-rank disagreement, and this particular disagreement is
+    # silent: every rank would read a shifted window of its peers' partial sums and
+    # return plausible wrong numbers with no fault.
+    offsets = {r["slab_offset"] for r in rows}
+    assert len(offsets) == 1, (
+        f"the staging slab landed at different heap offsets across ranks: {offsets}. "
+        f"The reduce-scatter addresses peers as peer_base + (ptr - my_base), so every "
+        f"rank would read the wrong peer memory."
+    )
+
+    return {
+        "tp": tp_size,
+        "N": N,
+        "dtype": str(dtype),
+        "slab offset": r0["slab_offset"],
+        "M_max": r0["M_max"],
+        "warmed shapes": r0["warmed"],
+        "slabs": max(r["slabs"] for r in rows),
+        "slab MiB": r0["slab_B"] / (1 << 20),
+        "derived heap MiB": r0["derived_heap_B"] / (1 << 20),
+        "heap used MiB": (
+            max(r["heap_after_warmup_B"] or 0 for r in rows) / (1 << 20)
+        ),
+        "unwarmed M": r0["unwarmed_M"],
+        "unwarmed heap growth B": max((r["miss_growth_B"] or 0) for r in rows),
+        "unwarmed err": max(r["unwarmed_err"] for r in rows),
+    }
 
 
 @benchmark()
@@ -1145,6 +1378,16 @@ def main():
                 )
             )
         summarize(f"gemm_reduce_scatter_m_shard unbarriered drift [{dtype}]", rows)
+
+        # Shape coverage is a property of (N, dtype, tp), not of M -- M is exactly
+        # what it sweeps internally -- so it runs once per TP on the regime N/K.
+        rows = []
+        _, cov_n, cov_k = regime_shapes[0]
+        for tp in tp_sizes:
+            if cov_k % tp:
+                continue
+            rows.append(test_shape_coverage(tp, cov_n, cov_k, dtype))
+        summarize(f"gemm_reduce_scatter_m_shard shape coverage [{dtype}]", rows)
 
 
 if __name__ == "__main__":
