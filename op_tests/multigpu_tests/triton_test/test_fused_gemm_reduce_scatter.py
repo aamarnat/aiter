@@ -358,15 +358,28 @@ def _cache_probe(M, N, dtype, world_size):
         return {}
     # No output buffer is cached, by design: the ops are registered pure, so a
     # shared output would alias across calls and make `op(a) + op(b)` evaluate
-    # to `2 * op(b)`. Only the staging buffer is cached and pointer-stable.
-    staging, _sync, M_local, _device, block_m, block_n, num_sms, _num_warps = entry
+    # to `2 * op(b)`. Only the staging buffers are cached and pointer-stable.
+    (
+        stagings,
+        turn,
+        _sync,
+        M_local,
+        _device,
+        block_m,
+        block_n,
+        num_sms,
+        _num_warps,
+    ) = entry
     return {
         "block_m": block_m,
         "block_n": block_n,
         "num_sms": num_sms,
         "m_tail": bool(M_local % block_m),
         "n_tail": bool(N % block_n),
-        "staging_ptr": staging.data_ptr(),
+        # Every staging view for this (M, N, dtype), in slab-index order. A tuple of
+        # one unless AITER_GEMM_RS_STAGING_BUFFERS double-buffers.
+        "staging_ptrs": tuple(s.data_ptr() for s in stagings),
+        "turn": turn[0],
     }
 
 
@@ -651,8 +664,8 @@ def _worker_graph(tp_size, gpu_id, cfg):
             f"capture/replay; a cache miss inside a graph is a collective "
             f"symmetric-heap allocation and is illegal there."
         )
-        assert probe_after.get("staging_ptr") == probe_before.get("staging_ptr"), (
-            f"[rank {env['rank']}] the staging buffer was reallocated during "
+        assert probe_after.get("staging_ptrs") == probe_before.get("staging_ptrs"), (
+            f"[rank {env['rank']}] the staging buffers were reallocated during "
             f"capture/replay"
         )
         # There is deliberately no equivalent assertion for the output buffer:
@@ -800,15 +813,26 @@ def _worker_coverage(tp_size, gpu_id, cfg):
     So the contract under test is not "every shape is warmed" -- it cannot be --
     but "no shape allocates":
 
-      1. warmup builds exactly ONE staging slab per (N, dtype, world_size),
-         ``M_max`` rows tall, whatever the warmed set is;
+      1. warmup builds exactly ONE staging slab SET per (N, dtype, world_size) --
+         ``_STAGING_BUFFERS_PER_SHAPE`` disjoint slabs, ``M_max`` rows tall, a
+         constant -- whatever the warmed set is;
       2. an UNWARMED M below the ceiling costs ZERO heap bytes and is still
-         numerically correct, because its staging is a row-prefix view of the slab;
+         numerically correct, because its staging is a row-prefix view of the slabs;
       3. an M ABOVE the ceiling raises, naming the ceiling, instead of allocating;
       4. a ceiling the heap cannot hold is refused up front, not at request three.
 
     Point 2 is the one that would have caught the original bug, and point 3 is what
     makes the remaining coverage hole loud instead of fatal.
+
+    Two more, from double-buffered staging (task 3.1), because the slab set is where
+    they live:
+
+      5. consecutive calls alternate between the slabs, and allocate nothing doing
+         it -- a stuck index silently reinstates the write-after-read race the WAR
+         guard was dropped for;
+      6. every slab, and the index sequence, is identical on every rank. Both are
+         cross-rank invariants that no per-rank assertion can see, so the parent
+         compares them across the returned rows.
     """
     try:
         device = torch.device(f"cuda:{gpu_id}")
@@ -835,24 +859,42 @@ def _worker_coverage(tp_size, gpu_id, cfg):
             FUSED_RS.register_shape(m, N, dtype)
         FUSED_RS.warmup_buffers(dtype=dtype, group_name=group_name, max_m=max_m)
 
-        # (1) one slab, sized to the ceiling -- not one per warmed shape.
-        slabs = dict(getattr(FUSED_RS, "_SLABS", {}))
-        assert len(slabs) == 1, (
-            f"[rank {rank}] warmup built {len(slabs)} staging slab(s) for a single "
-            f"(N={N}, dtype={dtype}) and {len(warm_ms)} warmed M; it must build "
+        # (1) one slab SET, sized to the ceiling -- not one per warmed shape. The set
+        # holds _STAGING_BUFFERS_PER_SHAPE slabs (2 when double-buffered), which is a
+        # constant: what must not happen is the count growing with the warmed shapes.
+        n_buffers = FUSED_RS._STAGING_BUFFERS_PER_SHAPE
+        slab_sets = dict(getattr(FUSED_RS, "_SLABS", {}))
+        assert len(slab_sets) == 1, (
+            f"[rank {rank}] warmup built {len(slab_sets)} staging slab set(s) for a "
+            f"single (N={N}, dtype={dtype}) and {len(warm_ms)} warmed M; it must build "
             f"exactly one, or heap use grows with the number of shapes again"
         )
-        slab = next(iter(slabs.values()))
-        assert tuple(slab.shape) == (max_m, N), (
-            f"[rank {rank}] slab is {tuple(slab.shape)}, expected {(max_m, N)}: the "
-            f"slab must be sized from the declared ceiling, not from the warmed set"
+        slabs = next(iter(slab_sets.values()))
+        assert len(slabs) == n_buffers, (
+            f"[rank {rank}] the (N={N}, dtype={dtype}) slab set holds {len(slabs)} "
+            f"slab(s), expected {n_buffers} from _STAGING_BUFFERS_PER_SHAPE -- the "
+            f"heap was sized for that many by heap_bytes_required()"
         )
-        # Every warmed shape must be a view of that one slab, not its own buffer.
+        # Separate allocations, not two views of one buffer: overlapping staging would
+        # defeat the alternation double-buffering exists for.
+        assert len({s.data_ptr() for s in slabs}) == len(slabs), (
+            f"[rank {rank}] the staging slabs share a pointer "
+            f"({[hex(s.data_ptr()) for s in slabs]}); double-buffering requires "
+            f"disjoint buffers or the write-after-read race it removes is still there"
+        )
+        for i, slab in enumerate(slabs):
+            assert tuple(slab.shape) == (max_m, N), (
+                f"[rank {rank}] slab #{i} is {tuple(slab.shape)}, expected "
+                f"{(max_m, N)}: slabs must be sized from the declared ceiling, not "
+                f"from the warmed set"
+            )
+        want_ptrs = tuple(s.data_ptr() for s in slabs)
+        # Every warmed shape must be a view of that one slab set, not its own buffers.
         for m in warm_ms:
             probe = _cache_probe(m, N, dtype, world_size)
-            assert probe.get("staging_ptr") == slab.data_ptr(), (
-                f"[rank {rank}] M={m} does not stage into the shared slab "
-                f"(ptr {probe.get('staging_ptr')} vs slab {slab.data_ptr()})"
+            assert probe.get("staging_ptrs") == want_ptrs, (
+                f"[rank {rank}] M={m} does not stage into the shared slab set "
+                f"(ptrs {probe.get('staging_ptrs')} vs slabs {want_ptrs})"
             )
 
         heap_after_warmup = _symmetric_heap_offset()
@@ -891,11 +933,10 @@ def _worker_coverage(tp_size, gpu_id, cfg):
             f"the slab is not numerically equivalent to a dedicated buffer "
             f"(err ratio {miss_err:.4f})"
         )
-        assert _cache_probe(unwarmed_m, N, dtype, world_size).get(
-            "staging_ptr"
-        ) == slab.data_ptr(), (
-            f"[rank {rank}] the unwarmed M={unwarmed_m} entry does not view the slab"
-        )
+        assert (
+            _cache_probe(unwarmed_m, N, dtype, world_size).get("staging_ptrs")
+            == want_ptrs
+        ), f"[rank {rank}] the unwarmed M={unwarmed_m} entry does not view the slabs"
 
         # (3) above the ceiling: refuse, naming it. Never allocate.
         over_x = torch.zeros(over_m, K_local, dtype=dtype, device=device)
@@ -937,22 +978,72 @@ def _worker_coverage(tp_size, gpu_id, cfg):
             f"{raised[:400]}"
         )
 
-        # (5) the invariant the whole view design rests on: the slab must sit at the
-        # SAME heap offset on every rank, because the RS kernel addresses a peer's
-        # staging as peer_base + (ptr - my_base) and never learns the peer's real
-        # pointer. _get_slab checks this collectively, so reaching here already means
-        # it agreed -- but return the offset so the parent asserts it independently
-        # rather than trusting the op to police itself.
+        # (5) alternation, and the parity that makes it safe. With two slabs,
+        # consecutive calls must stage into DIFFERENT buffers -- otherwise the WAR
+        # race the guard was dropped for is still live -- and the index must advance
+        # identically on every rank, which the parent asserts from `turn_seq`.
+        #
+        # The sequence is checked for CYCLING, not for starting at zero. Warmup does
+        # leave the index at 0 (it advances once per buffer, so it wraps), but the
+        # unwarmed-M call in step (2) above then advances it to 1, and every earlier
+        # step of this worker is free to move it again. Pinning the start would make
+        # this assertion a statement about how many calls the test made before
+        # reaching here -- which is not the invariant, and which is exactly how it
+        # first failed. What matters is that the index advances by one modulo the
+        # buffer count on every call, and that every rank is on the same one; the
+        # parent's cross-rank comparison of the whole sequence covers the start.
+        turn_seq = []
+        seen_ptrs = []
+        alt_x = torch.zeros(warm_ms[0], K_local, dtype=dtype, device=device)
+        alt_w = torch.zeros(N, K_local, dtype=dtype, device=device)
+        for _ in range(2 * n_buffers):
+            probe = _cache_probe(warm_ms[0], N, dtype, world_size)
+            turn_seq.append(probe["turn"])
+            seen_ptrs.append(probe["staging_ptrs"][probe["turn"]])
+            torch.ops.aiter.gemm_reduce_scatter_m_shard(
+                alt_x, [alt_w.t()], None, 0, group_name
+            )
+        torch.cuda.synchronize()
+        want_seq = [(turn_seq[0] + i) % n_buffers for i in range(2 * n_buffers)]
+        assert turn_seq == want_seq, (
+            f"[rank {rank}] the staging index did not cycle: {turn_seq}, expected "
+            f"{want_seq} (starting from the index this worker happened to be on). "
+            f"With one buffer that is all zeros by design; with two, a stuck index "
+            f"means every call overwrites the buffer peers may still be pulling from."
+        )
+        if n_buffers > 1:
+            assert seen_ptrs[0] != seen_ptrs[1], (
+                f"[rank {rank}] consecutive calls staged into the same buffer "
+                f"0x{seen_ptrs[0]:x}; double-buffering is not in effect"
+            )
+        # No heap growth from any of that: the alternate slab is warmup's, not new.
+        if heap_after_warmup is not None:
+            assert _symmetric_heap_offset() == heap_after_warmup, (
+                f"[rank {rank}] alternating between staging buffers allocated "
+                f"{_symmetric_heap_offset() - heap_after_warmup} B on the heap"
+            )
+
+        # (6) the invariant the whole view design rests on: every slab must sit at
+        # the SAME heap offset on every rank, because the RS kernel addresses a
+        # peer's staging as peer_base + (ptr - my_base) and never learns the peer's
+        # real pointer. _get_slabs checks this collectively, so reaching here already
+        # means it agreed -- but return the offsets so the parent asserts them
+        # independently rather than trusting the op to police itself.
         heap_base = FUSED_RS._heap_base()
-        slab_offset = None if heap_base is None else slab.data_ptr() - heap_base
+        slab_offsets = (
+            None
+            if heap_base is None
+            else tuple(s.data_ptr() - heap_base for s in slabs)
+        )
 
         res = {
             "rank": rank,
-            "slab_offset": slab_offset,
+            "slab_offsets": slab_offsets,
+            "turn_seq": turn_seq,
             "M_max": max_m,
             "warmed": len(warm_ms),
             "slabs": len(slabs),
-            "slab_B": int(slab.numel()) * slab.element_size(),
+            "slab_B": sum(int(s.numel()) * s.element_size() for s in slabs),
             "derived_heap_B": heap_need,
             "heap_after_warmup_B": heap_after_warmup,
             "miss_growth_B": miss_growth,
@@ -1176,18 +1267,29 @@ def test_shape_coverage(tp_size, N, K, dtype):
     # cannot see a cross-rank disagreement, and this particular disagreement is
     # silent: every rank would read a shifted window of its peers' partial sums and
     # return plausible wrong numbers with no fault.
-    offsets = {r["slab_offset"] for r in rows}
+    offsets = {r["slab_offsets"] for r in rows}
     assert len(offsets) == 1, (
-        f"the staging slab landed at different heap offsets across ranks: {offsets}. "
+        f"the staging slabs landed at different heap offsets across ranks: {offsets}. "
         f"The reduce-scatter addresses peers as peer_base + (ptr - my_base), so every "
         f"rank would read the wrong peer memory."
+    )
+
+    # Same argument, one level up: with two slabs the ranks must also agree on WHICH
+    # of them each call uses. A rank staging into slab 0 pulls its peers' slab 0
+    # whatever those peers are writing, so divergent parity is both wrong numbers and
+    # the write-after-read race back again -- and no rank can see it alone.
+    turns = {tuple(r["turn_seq"]) for r in rows}
+    assert len(turns) == 1, (
+        f"the ranks used different staging slab indices for the same call sequence: "
+        f"{turns}. Double-buffering requires rank-identical parity."
     )
 
     return {
         "tp": tp_size,
         "N": N,
         "dtype": str(dtype),
-        "slab offset": r0["slab_offset"],
+        "slab offsets": r0["slab_offsets"],
+        "turn seq": r0["turn_seq"],
         "M_max": r0["M_max"],
         "warmed shapes": r0["warmed"],
         "slabs": max(r["slabs"] for r in rows),

@@ -30,17 +30,22 @@ takes a row-prefix view of the staging slab warmup already reserved for the
 scheduler's whole M range (see "Heap sizing" below). It still JIT-compiles the
 RS kernel for that specialization, which capture forbids, so a miss inside a
 capture region is refused -- but outside one it is cheap and expected. The
-steady-state call is a couple of dict lookups, an ordinary ``torch.empty`` for
-the output, a ``torch.mm``/``torch.addmm`` into the cached heap buffer, up to two
-1-element ``dist.all_reduce`` sync tokens and the Triton RS launch -- no
-allocation, no host sync, no device query.
+steady-state call is a couple of dict lookups, a list-index bump to pick the
+staging buffer, an ordinary ``torch.empty`` for the output, a
+``torch.mm``/``torch.addmm`` into the cached heap buffer, up to two 1-element
+``dist.all_reduce`` sync tokens and the Triton RS launch -- no allocation, no host
+sync. The one device query is a ``cudaStreamIsCapturing``, issued only in the
+single configuration that needs it (see "Graph capture freezes the parity").
 
 Heap sizing
 -----------
 The symmetric heap is sized from the workload, not fixed. See the block comment
 above ``_HEAP_ALIGNMENT`` for the failure that motivated it, why enumerating the
-scheduler's shapes is impossible, and why one slab per (N, dtype) with per-shape
-views is the answer. The entry points are ``heap_bytes_required()`` (pure
+scheduler's shapes is impossible, and why a fixed small number of slabs per
+(N, dtype) with per-shape views is the answer. How many slabs is
+``AITER_GEMM_RS_STAGING_BUFFERS`` (see "Double-buffered staging" below) and it is
+a term in the sizing, so the two cannot drift. The entry points are
+``heap_bytes_required()`` (pure
 arithmetic, callable before the context exists), ``init_iris(heap_size=...)`` and
 ``warmup_buffers(max_m=...)``; ``AITER_GEMM_RS_HEAP_BYTES`` overrides the
 derivation, and every number is printed at warmup.
@@ -109,7 +114,80 @@ Every rank must agree on *both* variables. The mode fixes how many collectives
 each call issues and the impl fixes which collective, so a rank that disagrees
 on either deadlocks -- one rank waiting in RCCL while another spins on heap
 flags produces no diagnostic at all. ``warmup_buffers`` checks both
-(``_check_sync_mode_agreement``).
+(``_check_config_agreement``).
+
+Double-buffered staging -- how ``raw`` is made safe
+---------------------------------------------------
+``AITER_GEMM_RS_STAGING_BUFFERS`` (default 2) allocates *two* staging slabs per
+(N, dtype, world_size) and alternates between them, so the buffer a peer may
+still be pulling from is never the buffer the next GEMM overwrites. That removes
+the WAR hazard **by construction** instead of by synchronising, which is the
+whole point: the WAR guard is what ``raw`` drops.
+
+The safety argument, precisely. Let call *i* write buffer *b*. The next write to
+*b* is call *i+2*. Between them sits call *i+1*, whose RAW guard is
+stream-ordered *after* every peer's call-*i* reduce-scatter kernel, so leaving
+that guard proves every peer has finished reading *b*. **Exactly one intervening
+guard is required**, and ``raw`` still issues one on every call. Under ``none``
+there is no intervening guard at all, so ``none`` stays racy with two buffers --
+deliberately (see ``AITER_GEMM_RS_CHECK_PARITY`` below and the falsification arm
+in the evidence scripts).
+
+Which buffer -- the parity source, and why it is rank-consistent
+----------------------------------------------------------------
+The buffer index is a **per-slab-key call counter**: one counter per
+(N, dtype, world_size), advanced once per op invocation. Per *slab key*, not
+global: with two N in play and calls interleaved N1, N2, N1, N2, a single global
+counter hands N1 the indices 0, 2 and N2 the indices 1, 3 -- each always the same
+buffer, and double-buffering silently achieves nothing.
+
+**The assumption, stated explicitly.** Buffer parity must be *identical on every
+rank* for a given call: the RS kernel addresses a peer's staging as
+``peer_base + (ptr - my_base)``, so a rank pulling while on index 0 reads its
+peers' *index-0* slab whatever index those peers are actually writing. A counter
+gives that only if every rank invokes the op the same number of times, in the
+same order, per slab key. It does, because tensor parallelism is SPMD: every TP
+rank executes the identical compiled graph over the identical broadcast
+scheduler output, so the sequence of (N, dtype, world_size) invocations -- and
+hence of counter advances -- is the same everywhere. M varies from step to step
+with batch composition, but M is not a term in the slab key and every M is a
+row-prefix view of the same slab, so a varying M cannot desynchronise the
+counter. Independently: in ``both`` and ``raw`` the per-call guard is itself
+collective, so ranks that disagreed on the call count would already deadlock (or
+diverge the device-barrier epoch) before parity could matter.
+
+That is an argument, and the failure it guards is silent, so it is *checked*
+rather than trusted, in the manner of ``_check_slab_offset_agreement``:
+``warmup_buffers`` all-reduces every counter at the end of warmup, and
+``AITER_GEMM_RS_CHECK_PARITY=1`` adds a per-call collective check of the index
+about to be used. The per-call check is the load-bearing one -- the counter is a
+run-time quantity and the warmup check only floors its initial state -- so
+``docs/evidence/rs_correctness.py`` enables it. It is off by default because it
+puts a collective and a host sync on the hot path.
+
+Graph capture freezes the parity, so capture keeps the WAR guard
+-----------------------------------------------------------------
+``torch.mm(..., out=staging)`` bakes the staging *pointer* into a captured HIP
+graph. The Python wrapper does not run on replay, so the counter does not
+advance: alternation is live within one replay and **frozen across replays**. If
+a captured graph holds an odd number of calls for a slab key, the last call of
+replay *k* and the first call of replay *k+1* write the same buffer with no
+intervening guard, and the WAR race is back -- silently. The number of calls a
+graph holds is a property of where Inductor split the graph, not of the model,
+so it cannot be assumed and cannot be observed from here.
+
+So the rule is: **alternation replaces the WAR guard only where alternation is
+live, which is eager execution.** A call being recorded into a graph emits the
+WAR guard as usual (``torch.cuda.is_current_stream_capturing()``, the same probe
+``_refuse_if_capturing`` uses). This is correct by construction in both regimes,
+and it costs one ``cudaStreamIsCapturing`` per call -- only in the one mode that
+needs it, ``raw`` with more than one buffer; every other mode short-circuits.
+
+**What that means for the numbers.** vLLM captures decode and runs prefill
+eagerly, so double-buffering speeds up prefill and leaves captured decode
+paying exactly what ``both`` pays. Any measurement taken with an eager harness
+(``docs/evidence/rs_perf.py``) is a prefill number and does *not* transfer to
+production decode. Say so when quoting it.
 """
 
 import os
@@ -179,6 +257,81 @@ if _SYNC_IMPL not in ("rccl", "device"):
     _SYNC_IMPL = "rccl"
 
 
+# --- how many staging slabs per (N, dtype), resolved once at import ----------
+# 2 (the default) double-buffers: consecutive calls alternate, so the buffer a
+# peer may still be pulling from is never the one the next GEMM overwrites, and
+# the WAR guard is unnecessary in eager execution. 1 restores the single-slab
+# behaviour every number before task 3.1 was measured with, so `both` + one
+# buffer stays selectable for comparison without editing code.
+#
+# This multiplies the symmetric heap requirement -- `heap_bytes_required()`
+# reads it -- so the sizing and the allocation cannot drift apart.
+_STAGING_BUFFERS_ENV = "AITER_GEMM_RS_STAGING_BUFFERS"
+_STAGING_BUFFERS_PER_SHAPE = 2
+_raw_buffers = (os.environ.get(_STAGING_BUFFERS_ENV) or "").strip()
+if _raw_buffers:
+    if _raw_buffers in ("1", "2"):
+        _STAGING_BUFFERS_PER_SHAPE = int(_raw_buffers)
+    else:
+        print(
+            f"⚠ {_STAGING_BUFFERS_ENV}={_raw_buffers!r} is not '1' or '2'; falling "
+            f"back to {_STAGING_BUFFERS_PER_SHAPE}."
+        )
+del _raw_buffers
+
+_DOUBLE_BUFFERED = _STAGING_BUFFERS_PER_SHAPE > 1
+
+# WAR is dropped in `raw`, and alternation is what replaces it -- but alternation
+# is frozen inside a captured graph (see the module docstring), so a call being
+# recorded into one must still emit the guard. True only in the single
+# configuration where that question arises; every other mode short-circuits the
+# capture probe away entirely.
+_WAR_ON_CAPTURE = _SYNC_MODE == "raw" and _DOUBLE_BUFFERED
+
+# DIAGNOSTIC ONLY, and it disables a correctness rule -- do not set it in a
+# deployment. `AITER_GEMM_RS_WAR_ON_CAPTURE=0` drops the guard above, leaving
+# `raw` relying on alternation even inside a captured graph, where alternation is
+# frozen. It exists so the rule can be *falsified* rather than merely argued, and
+# it has been: docs/evidence/rs_war_probe.py's graph-replay phase corrupts
+# 18,351,559 elements with it off and is clean with it on, while the eager phase
+# passes either way (radha job 63369, arm W4). A rule nothing can break is a rule
+# nobody can check.
+#
+# It must be rs_war_probe.py and not rs_race_probe.py: the latter synchronises the
+# host every iteration, so no write-after-read window can form and it passes this
+# setting -- and passes single-buffer `raw` too. See its docstring.
+_WAR_ON_CAPTURE_ENV = "AITER_GEMM_RS_WAR_ON_CAPTURE"
+_WAR_ON_CAPTURE_DISABLED = (os.environ.get(_WAR_ON_CAPTURE_ENV) or "").strip() in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
+if _WAR_ON_CAPTURE_DISABLED and _WAR_ON_CAPTURE:
+    _WAR_ON_CAPTURE = False
+    print(
+        f"⚠ {_WAR_ON_CAPTURE_ENV}=0: the write-after-read guard is now dropped "
+        f"inside CUDA/HIP graph capture too. Buffer alternation is FROZEN by "
+        f"capture, so a replayed graph holding an odd number of these calls will "
+        f"race. This is a diagnostic setting for falsifying that claim; it is not "
+        f"safe to deploy."
+    )
+
+# --- opt-in per-call collective parity check ---------------------------------
+# The load-bearing verification of the parity invariant: no rank can observe its
+# own divergence, so this all-reduces the buffer index every call. It is a
+# collective plus a host sync on the hot path, so it is off by default and turned
+# on by the rs_correctness.py runs. Deliberately NOT set on the race/WAR probes:
+# a collective and a host sync per call is exactly the thing those must not have,
+# since it would close the very window they exist to open.
+_CHECK_PARITY = (os.environ.get("AITER_GEMM_RS_CHECK_PARITY") or "").strip() in (
+    "1",
+    "true",
+    "True",
+    "yes",
+)
+
+
 # --- diagnostic tracing, off unless asked for --------------------------------
 # Set AITER_GEMM_RS_TRACE=1 to emit one line per symmetric-heap allocation and
 # (at =2) one line per launch. Pair it with AMD_SERIALIZE_KERNEL=3: dispatch
@@ -227,10 +380,12 @@ _CACHED_NUM_SMS = None  # cached SM count to avoid a host query during graph cap
 # of the TP size up to ``max_num_batched_tokens``, and one buffer each would need
 # sum(M)*N*itemsize -- 68 GiB at max_num_batched_tokens=8192, N=8192, bf16.
 #
-# THE FIX. One SLAB per (N, dtype, world_size), sized for the largest M the
-# scheduler can hand the op, and every shape is a row-prefix VIEW of it. Cost drops
-# from O(sum of M) to O(M_max) -- 128 MiB for the case above -- and it covers every
-# M <= M_max with no holes, so no shape can allocate at run time.
+# THE FIX. A fixed, small number of SLABS per (N, dtype, world_size) -- one, or two
+# when double-buffered -- each sized for the largest M the scheduler can hand the op,
+# and every shape is a row-prefix VIEW of them. Cost drops from O(sum of M) to
+# O(buffers * M_max) -- 128 MiB per buffer for the case above -- and it covers every
+# M <= M_max with no holes, so no shape can allocate at run time. The buffer count is
+# a term in `heap_bytes_required()`, so sizing and allocation move together.
 #
 # The view is exactly as safe as a dedicated allocation: iris's reduce-scatter reads
 # the tensor's own shape and strides and translates addresses as
@@ -238,19 +393,15 @@ _CACHED_NUM_SMS = None  # cached SM count to avoid a host query during graph cap
 # and slabs are allocated collectively in the same order on every rank, so that
 # offset is rank-identical. Sharing one slab across different M is the same aliasing
 # argument the buffer cache already makes for sharing one buffer across layers: the
-# stream orders the calls, and the RAW/WAR guards extend that ordering across ranks.
+# stream orders the calls, and the guards -- or, when double-buffered, the
+# alternation plus the next call's RAW guard -- extend that ordering across ranks.
 _HEAP_ALIGNMENT = 1024  # iris TorchAllocator.allocate()'s default alignment
 
-# Staging buffers per (N, dtype) slab set. ONE today.
+# Staging buffers per (N, dtype) slab set: see _STAGING_BUFFERS_PER_SHAPE above,
+# resolved from AITER_GEMM_RS_STAGING_BUFFERS at import. They are SEPARATE M_max
+# slabs, never two prefix views of one slab -- overlapping views would defeat the
+# WAR elimination that is the whole point.
 #
-# Task 3.1 (double-buffered staging) makes this 2 and is the reason sizing is
-# expressed as a multiplier rather than a number: bumping this constant re-derives
-# the heap instead of forcing a re-measurement. When 3.1 lands it must allocate TWO
-# SEPARATE M_max slabs and alternate between them -- not two prefix views of one
-# slab, which overlap and would defeat the WAR elimination that is the point of
-# double buffering.
-_STAGING_BUFFERS_PER_SHAPE = 1
-
 # Headroom for iris's own heap traffic: ``device_barrier`` allocates one
 # ``num_ranks``-element int32 flags tensor per process group (32 B at TP=8, rounded
 # to 1 KiB), and future iris versions may add more. 1 MiB is ~0.8% of a typical
@@ -272,8 +423,19 @@ _HEAP_BYTES_ENV = "AITER_GEMM_RS_HEAP_BYTES"
 # pre-slab behaviour and is what the op_tests and evidence scripts get.
 _MAX_M = 0
 
-# (N, dtype, world_size) -> the (rows, N) symmetric-heap slab every M views into.
+# (N, dtype, world_size) -> the tuple of (rows, N) symmetric-heap slabs every M
+# views into. One element unless double-buffered, in which case consecutive calls
+# alternate; the slabs are allocated back to back in index order on every rank, so
+# both sit at rank-identical heap offsets (checked -- _check_slab_offset_agreement).
 _SLABS = {}
+
+# (N, dtype, world_size) -> a one-element list holding the index of the staging
+# slab the NEXT call for that key will use. A list, not an int, so the hot path can
+# bump it through the reference already unpacked from the buffer-cache entry rather
+# than rebuilding the key. Every entry that views a given slab set shares the one
+# cell -- the hazard is per slab, not per M. See the module docstring for why this
+# is rank-consistent and how that is verified.
+_SLAB_TURN = {}
 
 # Set once warmup_buffers() has run. After that, a *new* (N, dtype) slab is heap the
 # capacity check never budgeted for, which is a different and worse event than an
@@ -284,18 +446,21 @@ _WARMUP_DONE = False
 # (M, N, dtype) so that layers with different N do not trigger a symmetric-heap
 # allocation during capture. Value is a flat tuple so the hot path is a single
 # unpack:
-#   (staging, sync_tensor, M_local, device, block_m, block_n, num_sms, num_warps)
-# `staging` is the (M, N) symmetric-heap partial-sum buffer, `sync_tensor` a
-# preallocated 1-element int32 token, and the last four entries are the RS launch
-# config resolved once here rather than per call. The OUTPUT is deliberately not
-# cached -- see the module docstring.
+#   (stagings, turn, sync_tensor, M_local, device, block_m, block_n, num_sms,
+#    num_warps)
+# `stagings` is the tuple of (M, N) symmetric-heap partial-sum buffers -- one
+# row-prefix view per slab -- `turn` the shared one-element index cell from
+# _SLAB_TURN, `sync_tensor` a preallocated 1-element int32 token, and the last four
+# entries are the RS launch config resolved once here rather than per call. The
+# OUTPUT is deliberately not cached -- see the module docstring.
 #
 # Sharing one staging buffer across every layer with the same (M, N, dtype) is
 # safe even though it looks unsafe: all calls are issued on the same stream, so a
 # later op's GEMM cannot begin writing staging until the earlier op's RS kernel
-# has finished reading it (stream order), and the WAR guard extends that ordering
-# across ranks. With AITER_GEMM_RS_SYNC=raw|none the cross-rank half of that
-# argument no longer holds -- that is exactly the race those modes accept.
+# has finished reading it (stream order), and the WAR guard -- or, when
+# double-buffered, the alternation plus the next call's RAW guard -- extends that
+# ordering across ranks. With AITER_GEMM_RS_SYNC=none neither holds; that is
+# exactly the race that mode accepts.
 _BUFFER_CACHE = {}
 
 # One sync token is enough for every shape: it only carries stream ordering.
@@ -365,7 +530,7 @@ def heap_bytes_required(
             buffer cache is keyed on ``x.dtype``.
         world_size: TP size, for the log line only.
         buffers_per_shape: Override for ``_STAGING_BUFFERS_PER_SHAPE``; used to ask
-            "what would this cost after task 3.1".
+            what the other staging configuration would cost.
 
     Returns:
         Bytes. Includes ``_HEAP_SLACK_BYTES``.
@@ -492,7 +657,9 @@ def _heap_base():
         return None
 
 
-def _check_slab_offset_agreement(slab, N: int, dtype, world_size: int) -> None:
+def _check_slab_offset_agreement(
+    slab, N: int, dtype, world_size: int, index: int = 0
+) -> None:
     """Verify every rank put this slab at the SAME heap offset. Collective.
 
     This is the invariant the whole slab-and-view design rests on, and it is
@@ -504,10 +671,11 @@ def _check_slab_offset_agreement(slab, N: int, dtype, world_size: int) -> None:
     the same offset into ITS heap. It does, because iris's allocator is a bump
     allocator and every rank runs the identical allocation sequence: the shape set
     is derived from the same model config, deduplicated and then SORTED, so the warm
-    loop visits shapes in the same order everywhere; ``_create_entry`` (which
-    allocates the slab) runs before ``_warm_both_sync_impls`` (which allocates the
-    barrier flags) on every rank; and iris never frees, so an offset can never be
-    reused out of order.
+    loop visits shapes in the same order everywhere; the slabs of a double-buffered
+    set are allocated back to back in index order, so index 1 lands at the same
+    offset everywhere too; ``_create_entry`` (which allocates the slabs) runs before
+    ``_warm_both_sync_impls`` (which allocates the barrier flags) on every rank; and
+    iris never frees, so an offset can never be reused out of order.
 
     That is an argument, though, and the failure it guards against is silent: a rank
     whose slab is 1 KiB further along would read a shifted window of every peer's
@@ -516,7 +684,7 @@ def _check_slab_offset_agreement(slab, N: int, dtype, world_size: int) -> None:
     collective is free.
 
     Encoded as ``(offset, -offset)`` reduced with MAX for the same reason
-    ``_check_sync_mode_agreement`` does it: MAX alone cannot tell "everyone agrees
+    ``_check_config_agreement`` does it: MAX alone cannot tell "everyone agrees
     on 4096" from "someone else said 4096".
     """
     if not (dist.is_available() and dist.is_initialized()):
@@ -530,7 +698,7 @@ def _check_slab_offset_agreement(slab, N: int, dtype, world_size: int) -> None:
     got = [int(v) for v in t]
     if got != [mine, -mine]:
         raise RuntimeError(
-            f"fused GEMM+RS: the staging slab for (N={N}, dtype={dtype}, "
+            f"fused GEMM+RS: staging slab #{index} for (N={N}, dtype={dtype}, "
             f"world_size={world_size}) is at heap offset {mine} on this rank but not "
             f"on every rank (max seen {got[0]}, min seen {-got[1]}). The "
             f"reduce-scatter addresses a peer's staging as peer_base + (ptr - "
@@ -538,6 +706,59 @@ def _check_slab_offset_agreement(slab, N: int, dtype, world_size: int) -> None:
             f"memory and return plausible but wrong results with no fault. The ranks "
             f"have diverged in allocation order: warmup must be called collectively, "
             f"with the same shapes and dtypes, before anything else touches the heap."
+        )
+
+
+def _check_parity_agreement(N: int, dtype, world_size: int, index: int) -> None:
+    """Verify every rank is about to stage into the SAME slab index. Collective.
+
+    The double-buffering counterpart of ``_check_slab_offset_agreement``, and the
+    same class of invariant: invisible to any single-rank test, because no rank can
+    observe its own divergence.
+
+    Why it matters. The RS kernel reads a peer's staging as
+    ``peer_base + (ptr - my_base)``, so a rank pulling while on index 0 reads its
+    peers' index-0 slab whatever index those peers are actually writing. If parity
+    diverged, every rank would read a slab holding the *previous* call's partials --
+    plausible numbers, no fault -- and the WAR hazard double-buffering exists to
+    remove would be back at the same time. That is the reverse of the point.
+
+    Called at the end of warmup (where a collective is free, and where it floors the
+    initial state) and, when ``AITER_GEMM_RS_CHECK_PARITY=1``, before every call.
+    The per-call form is the load-bearing one: the index is a run-time quantity and
+    only the run-time check can catch a run-time divergence. It is opt-in because it
+    is a collective *and* a host sync -- ``int(t[0])`` -- on the hot path.
+
+    Never runs inside a graph capture region: reading the result would sync the
+    host, which capture forbids. Alternation is frozen under capture anyway (the WAR
+    guard is emitted there instead), so there is no parity to check.
+
+    Encoded as ``(index, -index)`` reduced with MAX for the reason
+    ``_check_config_agreement`` gives: MAX alone cannot tell "everyone agrees on
+    1" from "someone else said 1".
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        pass
+    mine = [index, -index]
+    t = torch.tensor(mine, dtype=torch.int64, device=_get_iris().get_device())
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    got = [int(v) for v in t]
+    if got != mine:
+        raise RuntimeError(
+            f"fused GEMM+RS: staging parity has diverged across ranks for "
+            f"(N={N}, dtype={dtype}, world_size={world_size}). This rank is about to "
+            f"use slab index {index}; the ranks span {-got[1]}..{got[0]}. The buffer "
+            f"index is a per-slab-key call counter, so this means the ranks have made "
+            f"different numbers of calls for this key -- which tensor parallelism is "
+            f"not supposed to allow (every rank runs the same graph over the same "
+            f"batch). Every rank pulls from its peers' slab at ITS OWN index, so "
+            f"continuing would read the previous call's partials on every rank and "
+            f"reinstate the write-after-read race, both silently."
         )
 
 
@@ -733,8 +954,12 @@ def declare_max_m(max_m: int) -> None:
     _MAX_M = max(_MAX_M, int(max_m))
 
 
-def _get_slab(N: int, dtype: torch.dtype, world_size: int, M: int):
-    """The (rows, N) staging slab for (N, dtype), allocating it if absent. COLLECTIVE.
+def _get_slabs(N: int, dtype: torch.dtype, world_size: int, M: int):
+    """The staging slabs for (N, dtype), allocating them if absent. COLLECTIVE.
+
+    Returns a tuple of ``_STAGING_BUFFERS_PER_SHAPE`` separate (rows, N) slabs --
+    separate, not prefix views of one, because overlapping buffers would defeat the
+    alternation they exist for.
 
     ``ctx.zeros`` ends in a host ``dist.barrier()`` plus a heap-base all-gather and
     Iris never frees, so this must run at warmup: it is not legal during graph
@@ -742,9 +967,9 @@ def _get_slab(N: int, dtype: torch.dtype, world_size: int, M: int):
     once per (N, dtype, world_size) when a ceiling has been declared.
     """
     key = (N, dtype, world_size)
-    slab = _SLABS.get(key)
-    if slab is not None and M <= slab.shape[0]:
-        return slab
+    slabs = _SLABS.get(key)
+    if slabs is not None and M <= slabs[0].shape[0]:
+        return slabs
 
     if _MAX_M and M > _MAX_M:
         # The scheduler exceeded the ceiling the heap was sized from. Refuse rather
@@ -760,52 +985,68 @@ def _get_slab(N: int, dtype: torch.dtype, world_size: int, M: int):
             f"scheduler at {_MAX_M} tokens."
         )
 
-    if slab is None and _WARMUP_DONE:
+    if slabs is None and _WARMUP_DONE:
         # An N that warmup never saw, so `_check_heap_capacity` never budgeted for
         # it. This DOES allocate on the never-freeing heap. It cannot happen in the
         # vLLM path (sequence parallelism reduce-scatters only the residual stream,
         # so there is exactly one N, and warmup is told it) -- but if it ever does,
         # the heap can be exhausted again and the log must say why.
         print(
-            f"⚠ fused GEMM+RS: allocating a staging slab for (N={N}, dtype={dtype}) "
-            f"AFTER warmup. This N was not in the warm set, so the heap budget did "
-            f"not include it: {max(_MAX_M, M)} x {N} more bytes are being taken from "
-            f"a heap that never frees. Declare this N at warmup "
+            f"⚠ fused GEMM+RS: allocating {_STAGING_BUFFERS_PER_SHAPE} staging "
+            f"slab(s) for (N={N}, dtype={dtype}) AFTER warmup. This N was not in the "
+            f"warm set, so the heap budget did not include it: "
+            f"{_STAGING_BUFFERS_PER_SHAPE} x {max(_MAX_M, M)} x {N} more bytes are "
+            f"being taken from a heap that never frees. Declare this N at warmup "
             f"(warmup_buffers(weight_shapes=...) or register_shape())."
         )
 
     rows = max(_MAX_M, M)
     iris_inst = _get_iris()
-    if _TRACE_ALLOC:
-        _off_before = _heap_offset()
-        _t0 = time.perf_counter()
-        _trace(
-            f"ALLOC begin M={rows} N={N} dtype={dtype} world={world_size} "
-            f"heap_offset_before={_off_before}"
-        )
-    new_slab = iris_inst.zeros((rows, N), dtype=dtype)
-    if _TRACE_ALLOC:
-        _trace(
-            f"ALLOC end   M={rows} N={N} heap_offset_after={_heap_offset()} "
-            f"wall_ms={(time.perf_counter() - _t0) * 1e3:.2f} "
-            f"staging_ptr=0x{new_slab.data_ptr():x}"
-        )
-    if slab is not None:
-        # The slab outgrew itself: either no ceiling was declared and M got bigger,
-        # or the ceiling was raised after this slab was built. The old slab cannot be
-        # freed (bump allocator) and existing cache entries keep viewing it, which
+    # Allocated back to back in index order on every rank, which is what makes both
+    # slabs land at rank-identical heap offsets (checked below, per slab).
+    new_slabs = []
+    for index in range(_STAGING_BUFFERS_PER_SHAPE):
+        if _TRACE_ALLOC:
+            _off_before = _heap_offset()
+            _t0 = time.perf_counter()
+            _trace(
+                f"ALLOC begin buf={index} M={rows} N={N} dtype={dtype} "
+                f"world={world_size} heap_offset_before={_off_before}"
+            )
+        new_slab = iris_inst.zeros((rows, N), dtype=dtype)
+        if _TRACE_ALLOC:
+            _trace(
+                f"ALLOC end   buf={index} M={rows} N={N} "
+                f"heap_offset_after={_heap_offset()} "
+                f"wall_ms={(time.perf_counter() - _t0) * 1e3:.2f} "
+                f"staging_ptr=0x{new_slab.data_ptr():x}"
+            )
+        new_slabs.append(new_slab)
+    if slabs is not None:
+        # The slabs outgrew themselves: either no ceiling was declared and M got
+        # bigger, or the ceiling was raised after they were built. The old ones cannot
+        # be freed (bump allocator) and existing cache entries keep viewing them, which
         # stays correct -- but it is wasted heap.
         print(
-            f"⚠ fused GEMM+RS: grew the (N={N}, dtype={dtype}) staging slab from "
-            f"{slab.shape[0]} to {rows} rows (M_max="
-            f"{_MAX_M or 'undeclared'}). The old slab cannot be reclaimed; declare "
+            f"⚠ fused GEMM+RS: grew the (N={N}, dtype={dtype}) staging slabs from "
+            f"{slabs[0].shape[0]} to {rows} rows (M_max="
+            f"{_MAX_M or 'undeclared'}). The old slabs cannot be reclaimed; declare "
             f"the ceiling once, before warmup, to avoid paying for both."
         )
-    # Before the slab is used for anything, and before it is cached: a divergent
+    # Before the slabs are used for anything, and before they are cached: a divergent
     # offset must not survive to become wrong numbers.
-    _check_slab_offset_agreement(new_slab, N, dtype, world_size)
-    _SLABS[key] = new_slab
-    return new_slab
+    for index, new_slab in enumerate(new_slabs):
+        _check_slab_offset_agreement(new_slab, N, dtype, world_size, index)
+    new_slabs = tuple(new_slabs)
+    _SLABS[key] = new_slabs
+    # The index cell is shared by every M that views this slab set: the hazard is
+    # per slab, not per shape. Rewound in place -- never replaced -- when the slabs
+    # are replaced, so a grown set starts from a rank-identical index while the cache
+    # entries that already hold this cell keep sharing it. The rewind is collective
+    # in effect: every rank reaches it in the same allocation, so no rank's index
+    # moves relative to another's.
+    _SLAB_TURN.setdefault(key, [0])[0] = 0
+    return new_slabs
 
 
 def _create_entry(M: int, N: int, dtype: torch.dtype, world_size: int):
@@ -836,17 +1077,23 @@ def _create_entry(M: int, N: int, dtype: torch.dtype, world_size: int):
     # writes it with `out=`, and `out=` on a mismatched shape RESIZES -- which would
     # silently replace the heap buffer with a fresh off-heap allocation on the hot
     # path and make every peer read garbage without raising.
-    staging = _get_slab(N, dtype, world_size, M)[:M]
-    assert tuple(staging.shape) == (M, N), (
-        f"staging view is {tuple(staging.shape)}, expected {(M, N)}"
-    )
+    slabs = _get_slabs(N, dtype, world_size, M)
+    stagings = tuple(slab[:M] for slab in slabs)
+    for staging in stagings:
+        assert tuple(staging.shape) == (M, N), (
+            f"staging view is {tuple(staging.shape)}, expected {(M, N)}"
+        )
 
     if _SYNC_TENSOR is None:
         _SYNC_TENSOR = torch.zeros(1, dtype=torch.int32, device=device)
 
-    entry = (staging, _SYNC_TENSOR, M_local, device) + _resolve_config(
-        world_size, M_local
-    )
+    entry = (
+        stagings,
+        _SLAB_TURN[(N, dtype, world_size)],
+        _SYNC_TENSOR,
+        M_local,
+        device,
+    ) + _resolve_config(world_size, M_local)
     _BUFFER_CACHE[(M, N, dtype, world_size)] = entry
     return entry
 
@@ -934,6 +1181,28 @@ def _device_barrier() -> None:
     _get_iris().device_barrier()
 
 
+def _is_capturing() -> bool:
+    """Is this call being recorded into a CUDA/HIP graph?
+
+    Only asked in the one configuration where the answer changes anything --
+    ``AITER_GEMM_RS_SYNC=raw`` with more than one staging buffer -- because that is
+    the only case where the WAR guard is dropped on the strength of alternation, and
+    alternation is frozen by capture (module docstring). Every other mode
+    short-circuits before reaching here, so no other mode pays for it.
+
+    ``torch.cuda.is_current_stream_capturing()`` is a ``cudaStreamIsCapturing``
+    query: no allocation, no host sync, no device work. Fails **closed** -- an
+    unanswerable question means emit the guard, which is slower and correct, rather
+    than skip it, which is faster and possibly wrong. That is the opposite of
+    ``_refuse_if_capturing``'s fail-open, and deliberately so: that one is a
+    diagnostic, this one is the correctness argument.
+    """
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return True
+
+
 def register_shape(M: int, N: int, dtype: torch.dtype = torch.bfloat16) -> None:
     """Record an (M, N, dtype) that a later ``warmup_buffers()`` should pre-allocate.
 
@@ -965,32 +1234,57 @@ def _warm_one(M: int, N: int, dtype: torch.dtype, world_size: int) -> None:
     ``AITER_GEMM_RS_SYNC_IMPL``: whichever primitive is selected, both are
     primed, so flipping *that* variable cannot move a collective into a capture
     region either.
+
+    Every staging buffer is warmed, and the index cell is advanced once per buffer,
+    so warmup is parity-neutral: it leaves the counter back at 0 on every rank
+    whatever the warm set is. Both slabs are first-touched here as a side effect,
+    which is why this loops rather than warming buffer 0 alone -- the Triton
+    specialization would not need it (both slabs are heap-aligned identically), but
+    a slab that is never written before its first real use is a page-fault storm on
+    a call that is supposed to be steady-state.
     """
     entry = _BUFFER_CACHE.get((M, N, dtype, world_size))
     if entry is None:
         entry = _create_entry(M, N, dtype, world_size)
-    staging, sync_tensor, M_local, device, block_m, block_n, num_sms, num_warps = entry
+    (
+        stagings,
+        turn,
+        sync_tensor,
+        M_local,
+        device,
+        block_m,
+        block_n,
+        num_sms,
+        num_warps,
+    ) = entry
 
     # hipBLASLt creates its handle and a per-problem workspace on the first matmul
     # of a given (M, K, N, dtype), so the GEMM must be warmed on the same shape too.
     # K is unknown here; use N, which at least forces handle creation.
     dummy_a = torch.empty((M, N), dtype=dtype, device=device)
     dummy_b = torch.empty((N, N), dtype=dtype, device=device)
-    torch.mm(dummy_a, dummy_b, out=staging)
-    del dummy_a, dummy_b
-
-    _warm_both_sync_impls(sync_tensor)
     dummy_out = torch.empty((M_local, N), dtype=dtype, device=device)
-    fast_reduce_scatter(
-        _get_iris(),
-        dummy_out,
-        staging,
-        block_m,
-        block_n,
-        num_sms,
-        num_warps,
-    )
-    _warm_both_sync_impls(sync_tensor)
+
+    for _ in range(len(stagings)):
+        index = turn[0]
+        turn[0] = (index + 1) % len(stagings)
+        staging = stagings[index]
+
+        torch.mm(dummy_a, dummy_b, out=staging)
+
+        _warm_both_sync_impls(sync_tensor)
+        fast_reduce_scatter(
+            _get_iris(),
+            dummy_out,
+            staging,
+            block_m,
+            block_n,
+            num_sms,
+            num_warps,
+        )
+        _warm_both_sync_impls(sync_tensor)
+
+    del dummy_a, dummy_b
 
 
 def _warm_both_sync_impls(sync_tensor: torch.Tensor) -> None:
@@ -1013,18 +1307,27 @@ def _warm_both_sync_impls(sync_tensor: torch.Tensor) -> None:
     _device_barrier()
 
 
-def _check_sync_mode_agreement() -> None:
-    """Verify every rank read the same AITER_GEMM_RS_SYNC and ..._SYNC_IMPL.
+def _check_config_agreement() -> None:
+    """Verify every rank read the same five AITER_GEMM_RS_* variables.
 
-    The mode decides how many guards each op issues and the impl decides which
-    primitive a guard is, so a rank that disagrees on *either* hangs the job with
-    no diagnostic -- easy to hit when a launcher exports the variables on some
-    nodes only. A mode mismatch changes the collective count; an impl mismatch is
-    nastier still, one rank blocking in RCCL while another spin-polls heap flags
-    that will never be bumped. Checked once at warmup, where a collective is
-    free.
+    All five change how many collectives a rank issues, or which, so a rank that
+    disagrees on any of them hangs the job with no diagnostic -- easy to hit when a
+    launcher exports the variables on some nodes only. Checked once at warmup, where
+    a collective is free, and before anything is allocated.
 
-    Both values are checked in a single all-reduce. Each is encoded as the pair
+    - ``AITER_GEMM_RS_SYNC`` decides how many guards each op issues: a mismatch
+      changes the collective count.
+    - ``AITER_GEMM_RS_SYNC_IMPL`` decides what a guard *is*, which is nastier still
+      -- one rank blocking in RCCL while another spin-polls heap flags that will
+      never be bumped.
+    - ``AITER_GEMM_RS_STAGING_BUFFERS`` changes the number of collective
+      ``ctx.zeros`` calls at warmup, so a mismatch both deadlocks and (if it got
+      past that) puts the slabs at different heap offsets on different ranks.
+    - ``AITER_GEMM_RS_CHECK_PARITY`` adds a collective to every call.
+    - ``AITER_GEMM_RS_WAR_ON_CAPTURE`` decides whether a captured call issues the
+      WAR guard, which is again a collective count.
+
+    All five are checked in a single all-reduce. Each is encoded as the pair
     ``(code, -code)`` and reduced with MAX, so any disagreement moves at least
     one of the two elements away from this rank's own value -- MAX alone could
     not distinguish "everyone agrees on 2" from "someone else said 2".
@@ -1033,26 +1336,30 @@ def _check_sync_mode_agreement() -> None:
         return
     mode_codes = {"both": 0, "raw": 1, "none": 2}
     impl_codes = {"rccl": 0, "device": 1}
-    mine_mode = mode_codes[_SYNC_MODE]
-    mine_impl = impl_codes[_SYNC_IMPL]
-    mine = [mine_mode, -mine_mode, mine_impl, -mine_impl]
+    fields = [
+        ("AITER_GEMM_RS_SYNC", mode_codes[_SYNC_MODE], repr(_SYNC_MODE)),
+        ("AITER_GEMM_RS_SYNC_IMPL", impl_codes[_SYNC_IMPL], repr(_SYNC_IMPL)),
+        (
+            _STAGING_BUFFERS_ENV,
+            _STAGING_BUFFERS_PER_SHAPE,
+            str(_STAGING_BUFFERS_PER_SHAPE),
+        ),
+        ("AITER_GEMM_RS_CHECK_PARITY", int(_CHECK_PARITY), str(_CHECK_PARITY)),
+        (_WAR_ON_CAPTURE_ENV, int(_WAR_ON_CAPTURE), str(_WAR_ON_CAPTURE)),
+    ]
+    mine = [v for _, code, _ in fields for v in (code, -code)]
     t = torch.tensor(mine, dtype=torch.int64, device=_get_iris().get_device())
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     got = [int(v) for v in t]
-    if got[:2] != mine[:2]:
-        raise RuntimeError(
-            f"AITER_GEMM_RS_SYNC disagrees across ranks (this rank: {_SYNC_MODE!r}). "
-            f"The mode controls how many collectives each fused GEMM+RS issues, so a "
-            f"mismatch deadlocks. Export the same value on every rank."
-        )
-    if got[2:] != mine[2:]:
-        raise RuntimeError(
-            f"AITER_GEMM_RS_SYNC_IMPL disagrees across ranks (this rank: "
-            f"{_SYNC_IMPL!r}). The impl controls which primitive each guard uses, so "
-            f"a mismatch deadlocks -- ranks on 'rccl' block in a collective the ranks "
-            f"on 'device' never join, and those spin on heap flags nobody bumps. "
-            f"Export the same value on every rank."
-        )
+    for i, (name, _, shown) in enumerate(fields):
+        if got[2 * i : 2 * i + 2] != mine[2 * i : 2 * i + 2]:
+            raise RuntimeError(
+                f"{name} disagrees across ranks (this rank: {shown}; the ranks span "
+                f"{-got[2 * i + 1]}..{got[2 * i]} as codes). Every one of the "
+                f"AITER_GEMM_RS_* variables changes how many collectives a rank "
+                f"issues, or which, so a mismatch deadlocks with no diagnostic. "
+                f"Export the same value on every rank."
+            )
 
 
 class HeapTooSmallError(RuntimeError):
@@ -1177,7 +1484,7 @@ def warmup_buffers(
         world_size = iris_inst.get_num_ranks()
     _check_iris_world_size(world_size, group_name)
 
-    _check_sync_mode_agreement()
+    _check_config_agreement()
 
     if dtype is None:
         dtypes = tuple(_DEFAULT_WARMUP_DTYPES)
@@ -1235,6 +1542,14 @@ def warmup_buffers(
         _warm_one(M, N, shape_dtype, world_size)
         warmed += 0 if already else 1
 
+    # Every rank must be on the same staging slab index before the first real call.
+    # _warm_one advances the index once per buffer, so this should be 0 everywhere;
+    # what it actually proves is that the ranks agree, which no rank can see alone.
+    # This only floors the initial state -- the index is a run-time quantity, so the
+    # per-call check under AITER_GEMM_RS_CHECK_PARITY is the load-bearing one.
+    for (slab_n, slab_dtype, slab_ws), turn in _SLAB_TURN.items():
+        _check_parity_agreement(slab_n, slab_dtype, slab_ws, turn[0])
+
     if _TRACE_ALLOC:
         # The VA map, so a later HSA fault address can be tested for membership.
         # If the faulting address lies outside every range printed here, the
@@ -1259,23 +1574,42 @@ def warmup_buffers(
         f"✓ Iris GEMM+RS warmup complete: num_sms={_CACHED_NUM_SMS}, "
         f"world_size={world_size}, dtypes={[str(d) for d in dtypes]}, "
         f"sync={_SYNC_MODE}, sync_impl={_SYNC_IMPL}, "
-        f"pre-allocated {warmed} buffer(s), {len(_BUFFER_CACHE)} cached"
+        f"staging_buffers={_STAGING_BUFFERS_PER_SHAPE}, "
+        f"check_parity={_CHECK_PARITY}, "
+        f"pre-allocated {warmed} shape(s), {len(_BUFFER_CACHE)} cached"
         + (f", skipped {skipped} (M not divisible by {world_size})" if skipped else "")
     )
+    if _WAR_ON_CAPTURE:
+        # Say it in the log, not only in the docstring: any perf number taken from
+        # an eager harness is a prefill number under this configuration.
+        print(
+            "ℹ Iris GEMM+RS: sync=raw with double-buffered staging. The WAR guard is "
+            "replaced by buffer alternation in EAGER execution only -- a call "
+            "recorded into a CUDA/HIP graph still emits it, because capture freezes "
+            "the buffer choice. vLLM captures decode and runs prefill eagerly, so "
+            "captured decode costs exactly what sync=both costs and only prefill "
+            "sees the saving."
+        )
 
     # The heap budget, in the job log, every run. A fixed 1 GiB that nothing printed
     # is what turned this failure into a week of guessing; a line that states what
     # was needed, what was taken and what is left makes the next one self-diagnosing.
     total, used = _heap_total(), _heap_offset()
-    slab_bytes = sum(int(s.numel()) * s.element_size() for s in _SLABS.values())
-    after_31 = heap_bytes_required(
-        slab_m, n_values, dtypes, world_size, buffers_per_shape=2
+    n_slabs = sum(len(s) for s in _SLABS.values())
+    slab_bytes = sum(
+        int(slab.numel()) * slab.element_size()
+        for slabs in _SLABS.values()
+        for slab in slabs
+    )
+    other = 1 if _STAGING_BUFFERS_PER_SHAPE == 2 else 2
+    alt = heap_bytes_required(
+        slab_m, n_values, dtypes, world_size, buffers_per_shape=other
     )
     print(
         f"✓ Iris GEMM+RS heap: M_max={slab_m} N={n_values} "
         f"dtypes={[str(d) for d in dtypes]} buffers/shape={_STAGING_BUFFERS_PER_SHAPE} "
         f"-> required={need} B ({need / (1 << 20):.1f} MiB); "
-        f"{len(_SLABS)} staging slab(s) hold {slab_bytes} B "
+        f"{n_slabs} staging slab(s) across {len(_SLABS)} shape(s) hold {slab_bytes} B "
         f"({slab_bytes / (1 << 20):.1f} MiB); "
         f"heap total={total} used={used}"
         + (
@@ -1283,8 +1617,8 @@ def warmup_buffers(
             if total and used is not None
             else ""
         )
-        + f"; after task 3.1 (2 buffers/shape) this would need {after_31} B "
-        f"({after_31 / (1 << 20):.1f} MiB)"
+        + f"; at {other} buffer(s)/shape this would need {alt} B "
+        f"({alt / (1 << 20):.1f} MiB)"
     )
     _WARMUP_DONE = True
 
@@ -1380,7 +1714,25 @@ def gemm_reduce_scatter_m_shard_wrapper(
     if entry is None:
         # Capture-unsafe (Triton JIT); deliberate and logged outside capture.
         entry = _entry_on_miss(M, N, x.dtype, world_size, group_name, "fused")
-    staging, sync_tensor, M_local, device, block_m, block_n, num_sms, num_warps = entry
+    (
+        stagings,
+        turn,
+        sync_tensor,
+        M_local,
+        device,
+        block_m,
+        block_n,
+        num_sms,
+        num_warps,
+    ) = entry
+
+    # Whose turn: alternate so the buffer a peer may still be pulling from is never
+    # the one this GEMM overwrites. One list index and one modulo of a 0/1 int.
+    index = turn[0]
+    turn[0] = (index + 1) % len(stagings)
+    staging = stagings[index]
+    if _CHECK_PARITY:
+        _check_parity_agreement(N, x.dtype, world_size, index)
 
     # Fresh, never cached: these ops are registered as pure, so a shared output
     # would make op(a) + op(b) evaluate to 2 * op(b). Capture-legal -- served
@@ -1390,7 +1742,8 @@ def gemm_reduce_scatter_m_shard_wrapper(
     if _TRACE_LAUNCH:
         _trace(
             f"FUSED M={M} N={N} K_local={x.shape[1]} dtype={x.dtype} "
-            f"bias={bias is not None} staging_ptr=0x{staging.data_ptr():x} "
+            f"bias={bias is not None} buf={index}/{len(stagings)} "
+            f"staging_ptr=0x{staging.data_ptr():x} "
             f"out_ptr=0x{output.data_ptr():x}"
         )
 
@@ -1414,7 +1767,11 @@ def gemm_reduce_scatter_m_shard_wrapper(
     )
 
     # WAR: every peer's pull must finish before the staging buffer is reused.
-    if _SYNC_WAR:
+    # Dropped in `raw` because alternation makes the reuse distance two calls, with
+    # the next call's RAW guard in between -- but only where alternation is live.
+    # A captured graph freezes the buffer choice at capture time, so a call being
+    # recorded into one still emits the guard. See the module docstring.
+    if _SYNC_WAR or (_WAR_ON_CAPTURE and _is_capturing()):
         _cross_rank_sync(sync_tensor)
 
     return output
@@ -1488,14 +1845,31 @@ def reduce_scatter_m_shard_wrapper(
     if entry is None:
         # Capture-unsafe (Triton JIT); deliberate and logged outside capture.
         entry = _entry_on_miss(M, N, x.dtype, world_size, group_name, "standalone")
-    staging, sync_tensor, M_local, device, block_m, block_n, num_sms, num_warps = entry
+    (
+        stagings,
+        turn,
+        sync_tensor,
+        M_local,
+        device,
+        block_m,
+        block_n,
+        num_sms,
+        num_warps,
+    ) = entry
+
+    # Whose turn -- see gemm_reduce_scatter_m_shard_wrapper.
+    index = turn[0]
+    turn[0] = (index + 1) % len(stagings)
+    staging = stagings[index]
+    if _CHECK_PARITY:
+        _check_parity_agreement(N, x.dtype, world_size, index)
 
     # Fresh, never cached -- see gemm_reduce_scatter_m_shard_wrapper.
     output = torch.empty((M_local, N), dtype=x.dtype, device=device)
 
     if _TRACE_LAUNCH:
         _trace(
-            f"STANDALONE M={M} N={N} dtype={x.dtype} "
+            f"STANDALONE M={M} N={N} dtype={x.dtype} buf={index}/{len(stagings)} "
             f"staging_ptr=0x{staging.data_ptr():x} out_ptr=0x{output.data_ptr():x}"
         )
 
@@ -1516,7 +1890,9 @@ def reduce_scatter_m_shard_wrapper(
     )
 
     # WAR: every peer's pull must finish before the staging buffer is reused.
-    if _SYNC_WAR:
+    # Dropped in `raw` only where alternation is live -- see
+    # gemm_reduce_scatter_m_shard_wrapper and the module docstring.
+    if _SYNC_WAR or (_WAR_ON_CAPTURE and _is_capturing()):
         _cross_rank_sync(sync_tensor)
 
     return output
